@@ -57,9 +57,9 @@ run_on_gpu() {
       --layer_idx "${LAYER_IDX}" \
       --rank_r 4 \
       --run_dir "${RUN_DIR}" \
-      --max_eval_samples 100 \
+      --max_eval_samples 40 \
       --attack_start 0 \
-      --n_attack_tokens 10 \
+      --n_attack_tokens 5 \
       --beam_k 512 \
       --rounds 20 \
       >"${LOG_FILE}" 2>&1
