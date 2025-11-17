@@ -189,6 +189,11 @@ def main():
         if (orig_pred != label) and (adv_pred == label):
             stats["n_flipped_to_correct_W_to_C"] += 1
 
+        orig_text = tokenizer.decode(input_ids, skip_special_tokens=True)
+        adv_text = tokenizer.decode(adv_ids, skip_special_tokens=True)
+
+        MAX_PRINT = 10
+
         all_results.append({
             "idx": idx,
             "label": label,
@@ -197,7 +202,18 @@ def main():
             "orig_loss": orig_loss,
             "adv_loss": adv_loss,
             "success": bool(success),
+            "orig_text": orig_text,
+            "adv_text": adv_text,
         })
+        
+        if success and stats["n_flipped_to_wrong_C_to_W"] <= MAX_PRINT:
+            print("\n====== [Attack Success Example] ======")
+            print(f"Sample idx = {idx}, label = {label}, orig_pred = {orig_pred}, adv_pred = {adv_pred}")
+            print("[ORIG]")
+            print(orig_text)
+            print("[ADV]")
+            print(adv_text)
+            print("======================================")
 
     # 3. 计算并打印指标
     summary = calculate_and_print_stats("reft_latent_adv", stats, n_samples=n_eval)
