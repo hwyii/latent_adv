@@ -17,14 +17,17 @@ class ReftClassificationDatasetForIntLabels(ReftDataset):
         self.label_field = kwargs["label_field"]
         
     def tokenize(self, data_item):
-
+        max_len = min(self.tokenizer.model_max_length, 512)
         result = {}
-        input_ids = self.tokenizer(data_item[self.input_field], max_length=self.tokenizer.model_max_length,
-            truncation=True, return_tensors="pt")["input_ids"][0]
+        enc = self.tokenizer(data_item[self.input_field], max_length=max_len,
+            truncation=True, return_tensors="pt")
+        input_ids = enc["input_ids"][0]
+        attention_mask = enc["attention_mask"][0]        
     
         base_prompt_length = len(input_ids)
         last_position = base_prompt_length - 1
         result["input_ids"] = input_ids
+        result["attention_mask"] = attention_mask
 
         # labels: 直接使用整数label 不做tokenizer
         # 需要转化为torch.Tensor
@@ -96,13 +99,6 @@ def build_reft_classification_datasets(
         print(f"[datasets] 使用完整的 ReFT 训练集 ({len(full_train_dataset)} 条)")
         train_dataset = full_train_dataset
 
-    # 在返回之前添加    
-    sample = train_dataset[0] if not isinstance(train_dataset, Subset) else train_dataset.dataset[train_dataset.indices[0]]  
-    # print("[DEBUG] sample keys:", sample.keys())
-    # print("[DEBUG] input_ids.shape:", sample["input_ids"].shape)
-    # print("[DEBUG] labels:", sample["labels"])
-    # print(f"  intervention_locations: {sample['intervention_locations']}")  
-    # print(f"  input_ids 长度: {len(sample['input_ids'])}")
     return train_dataset, eval_dataset
 
 

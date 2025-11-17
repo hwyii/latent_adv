@@ -45,10 +45,27 @@ def build_reft_model(
     model_dtype = next(base_model.parameters()).dtype
     hidden_size = base_model.config.hidden_size
     reft_comp_idx = reft_layer - 1
-    attack_comp_idx = attack_layer - 1
     
     # ReFT config: 指定插入层和 LoReFT 
     reft_config = ReftConfig(
+        representations=[
+            {
+                "layer": reft_layer,
+                "component": f"gpt_neox.layers[{reft_comp_idx}].output",
+                "low_rank_dimension": rank_r,
+                "intervention": LoreftIntervention(
+                    embed_dim=hidden_size,
+                    low_rank_dimension=rank_r,
+                    dtype=model_dtype,
+                    dropout=0.0,
+                    act_fn=None,
+                ),
+            },
+        ]
+    )
+    if attack_layer is not None:
+        attack_comp_idx = attack_layer - 1
+        reft_config = ReftConfig(
         representations=[
             # 1) LoReFT 本身
             {
@@ -63,15 +80,14 @@ def build_reft_model(
                     act_fn=None,
                 ),
             },
-            # 2) 新加的 adversarial 插件
+            # 2) inner attack用的 Adversarial Intervention
             {
                 "layer": attack_layer,
                 "component": f"gpt_neox.layers[{attack_comp_idx}].output",
-                # 这个不用 low_rank_dimension，只要能拿到 embed_dim 就行
                 "intervention": AdversarialIntervention(
                     embed_dim=hidden_size,
                 ),
-            },
+            }
         ]
     )
     
@@ -97,15 +113,17 @@ def load_reft_model_for_eval(
     rank_r: int,
     adv_intervention_dir: str,
     device: str,
+    attack_layer: int | None = None, 
 ) -> Tuple[ReftModel, AutoTokenizer]:
     # evaluate的时候要
     print(f"[load_reft_model] 1. 正在构建框架")
     reft_model, tokenizer = build_reft_model(
         model_name=model_name,
         baseline_ckpt=baseline_ckpt,
-        layer_idx=layer_idx,
+        reft_layer=layer_idx,
         rank_r=rank_r,
         device=device,
+        attack_layer=attack_layer, 
         disable_model_grads=True,  # eval 阶段总是 True
     )
     
