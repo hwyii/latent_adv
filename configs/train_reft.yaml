@@ -1,0 +1,55 @@
+device: "cuda" 
+
+model:
+  model_name: "EleutherAI/pythia-410m"
+  load_baseline_ckpt: "out/pythia410m/harmless/best_Harmless.pt"
+  layer_idx: 15
+  rank_r: 4
+  max_length: 512
+  position: "l1"
+  
+
+data:
+  split_file: "src/data/harmless_splits.json"
+  train_split: "ft_train" 
+  dataset: "AlignmentResearch/Harmless"
+  input_field: "content"
+  label_field: "clf_label"
+
+train:
+  train_bsz: 8
+  eval_bsz: 16
+  lr_wb: 0.0005
+  lr_all: 0.0001
+  weight_decay: 0.01
+  epochs: 3
+  seed: 42
+  r_init_mode: "random"
+
+  lambda_adv: 0.5
+  attack_layer: 2
+  inner_attack: "latent_pgd" 
+  eps_r: 0.05
+  gcg_steps: 3
+  gcg_topk: 2
+  gcg_alpha: null # 用默认eps/steps
+  
+  logging_steps: 50
+  evaluation_strategy: "epoch"
+  save_strategy: "epoch"
+  save_total_limit: 2
+
+  # early stopping
+  early_stopping_patience: 1
+  early_stopping_threshold: 0.0
+
+
+  # wandb配置
+  use_wandb: false
+  wandb_project: "latent_adv_reft_new"
+  wandb_entity: "heweiyi"
+  wandb_run_name: "reft_latent_adv_pythia410m_harmless"
+
+out:
+  dir: "out/pythia410m/harmless/reft_latent_adv"
+
