@@ -121,7 +121,7 @@ def token_level_gcg_single_baseline(
         adv_pred = int(adv_logits.argmax(-1).item())
         adv_loss = float(F.cross_entropy(adv_logits, label_t).item())
     success = (adv_pred != orig_pred)
-    return orig_pred, orig_loss, adv_pred, adv_loss, success, cur_ids.squeeze
+    return orig_pred, orig_loss, adv_pred, adv_loss, success, cur_ids.squeeze(0)
 
 # token-level GCG attack for reft model
 def token_level_gcg_single_reft(

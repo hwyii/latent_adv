@@ -4,11 +4,11 @@ set -e
 # 你的训练输出根目录
 RUN_ROOT="out/pythia410m/harmless/reft_latent_adv"
 BASELINE_CKPT="out/pythia410m/harmless/best_Harmless.pt"
-LOG_DIR="logs/gcg_eval"
+LOG_DIR="logs/gcg_eval_middle_100"
 mkdir -p "${LOG_DIR}"
 
 # 可用 GPU 列表：按需改
-GPUS=(0 1 2 3)
+GPUS=(0 1 2 3 4 5 6 7)
 NUM_GPUS=${#GPUS[@]}
 
 # 1) 收集所有 run_dir（含 final_intervention 的目录的上一级）
@@ -57,11 +57,12 @@ run_on_gpu() {
       --layer_idx "${LAYER_IDX}" \
       --rank_r 4 \
       --run_dir "${RUN_DIR}" \
-      --max_eval_samples 40 \
-      --attack_start 0 \
-      --n_attack_tokens 5 \
+      --max_eval_samples 100 \
+      --attack_start 10 \
+      --n_attack_tokens 10 \
       --beam_k 512 \
       --rounds 20 \
+      --output_json "${RUN_DIR}/token_gcg_middle_100_results.json" \
       >"${LOG_FILE}" 2>&1
 
     echo "[Worker][GPU ${GPU_ID}] 完成 ${RUN_DIR}，log 写入 ${LOG_FILE}"
