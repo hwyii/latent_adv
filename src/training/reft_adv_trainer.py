@@ -140,7 +140,26 @@ class ReftAdversarialTrainerForSequenceClassification(ReftTrainerForSequenceClas
 
                 with torch.no_grad():
                     g = delta_tensor.grad
-                    delta_tensor.add_(step_size * g.sign())
+                    
+                    if cfg.inner_attack == "latent_pgd":
+                        print("[inner attack] using latent_pgd")
+                        # PGD update, 所有坐标全维 sign update
+                        delta_tensor.add_(step_size * g.sign())
+                    elif cfg.inner_attack == "latent_gcg_coord":
+                        # GCG coordinate update, 每次只更新|grad|最大的top-k维
+                        print("[inner attack] using latent_gcg_coord")
+                        g_flat = g.view(-1)
+                        k = min(cfg.gcg_topk, g_flat.numel())
+                        
+                        topk_idx = g_flat.abs().topk(k=k).indices
+                        
+                        delta_flat = delta_tensor.view(-1)
+                        delta_flat[topk_idx] += step_size * g_flat[topk_idx].sign()
+                        
+                    else:
+                        raise ValueError(f"Unknown inner_attack type: {cfg.inner_attack}")
+                        
+                    
                     delta_tensor.clamp_(-eps, eps)
                     delta_tensor.grad.zero_()
                     # 下一步继续对这个 delta 求梯度
