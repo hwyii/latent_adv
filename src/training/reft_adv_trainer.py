@@ -104,7 +104,7 @@ class ReftAdversarialTrainerForSequenceClassification(ReftTrainerForSequenceClas
         if cfg is not None and cfg.inner_attack != "none":
             steps = cfg.steps
             eps = cfg.eps
-            step_size = cfg.lr or (eps / max(1, steps))
+            step_size = 2.5 * (eps / max(1, steps)) # step size 设置为 eps 和 steps 比值 的 2.5 倍
         
             self.adv_intervention.reset_delta()
         
