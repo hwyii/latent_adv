@@ -73,6 +73,7 @@ def main():
     parser.add_argument("--model_name", type=str, default="EleutherAI/pythia-410m")
     parser.add_argument("--baseline_ckpt", type=str, required=True,
                         help="如 out/pythia410m/harmless/best_Harmless.pt")
+    parser.add_argument("--data_dir", type=str, default="src/data/helpful_splits.json")
     parser.add_argument("--layer_idx", type=int, required=True)
     parser.add_argument("--rank_r", type=int, default=4)
     parser.add_argument("--run_dir", type=str, required=True,
@@ -91,6 +92,10 @@ def main():
     parser.add_argument("--n_attack_tokens", type=int, default=10)
     parser.add_argument("--beam_k", type=int, default=20)
     parser.add_argument("--rounds", type=int, default=20)
+    parser.add_argument("--attack_mode", type=str, default="suffix")
+    parser.add_argument("--n_candidates_per_it", type=int, default=128)
+    parser.add_argument("--reft_loc_mode", type=str, default="train",
+                        help="ReFT 干预位置的选择方式，train / last_token")
 
     args = parser.parse_args()
     set_seed(args.seed)
@@ -106,8 +111,10 @@ def main():
     # 简单起见，用 transformers 的 logger + 手动写一行说明
     logger.info(f"[Eval-GCG] Logging to {log_file}")
 
-    with open("src/data/harmless_splits.json", "r") as f:
+    with open(args.data_dir, "r") as f:
         splits = json.load(f)
+    #with open("src/data/helpful_splits.json", "r") as f:
+        #splits = json.load(f)
 
     attack_indices = splits["attack"] 
     
@@ -177,6 +184,9 @@ def main():
             attack_start=args.attack_start,
             beam_k=args.beam_k,
             rounds=args.rounds,
+            attack_mode=args.attack_mode,
+            n_candidates_per_it=args.n_candidates_per_it,
+            reft_loc_mode=args.reft_loc_mode,
         )
 
         # 更新统计

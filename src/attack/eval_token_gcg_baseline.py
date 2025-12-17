@@ -2,6 +2,7 @@ from html import parser
 import os
 import json
 import argparse
+from re import split
 from typing import Dict, Any
 
 import torch
@@ -23,6 +24,7 @@ def main():
                         help="如 out/pythia410m/harmless/best_Harmless.pt")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--dataset", type=str, default="AlignmentResearch/Harmless")
+    parser.add_argument("--split", type=str, default="validation")
     parser.add_argument("--input_field", type=str, default="content")
     parser.add_argument("--label_field", type=str, default="clf_label")
     parser.add_argument("--position", type=str, default="l1")
@@ -35,6 +37,8 @@ def main():
     parser.add_argument("--n_attack_tokens", type=int, default=5)
     parser.add_argument("--beam_k", type=int, default=512)
     parser.add_argument("--rounds", type=int, default=20)
+    parser.add_argument("--attack_mode", type=str, default="suffix")
+    parser.add_argument("--n_candidates_per_it", type=int, default=128)
 
     args = parser.parse_args()
     set_seed(args.seed)
@@ -56,8 +60,9 @@ def main():
     tokenizer.model_max_length = 512  # 和训练一致
 
     # 2) attack split
-    with open("src/data/harmless_splits.json", "r") as f:
+    with open(args.split, "r") as f:
         splits = json.load(f)
+
     attack_indices = splits["attack"]
 
     attack_dataset, _ = build_reft_classification_datasets(
@@ -101,6 +106,8 @@ def main():
             attack_start=args.attack_start,
             beam_k=args.beam_k,
             rounds=args.rounds,
+            attack_mode=args.attack_mode,
+            n_candidates_per_it=args.n_candidates_per_it,
         )
 
         if orig_pred == label:
@@ -130,7 +137,7 @@ def main():
     summary = calculate_and_print_stats("baseline", stats, n_samples=n_eval)
 
     if args.output_json is None:
-        args.output_json = "out/pythia410m/harmless/baseline_eval_token_gcg.json"
+        args.output_json = "out/pythia410m/helpful/suffix_baseline_eval_last_token_gcgcoord_100.json"
 
     os.makedirs(os.path.dirname(args.output_json), exist_ok=True)
     with open(args.output_json, "w") as f:
@@ -144,12 +151,15 @@ if __name__ == "__main__":
     main()
 
 '''
-CUDA_VISIBLE_DEVICES=0 python -m src.attack.eval_token_gcg_baseline \
-  --baseline_ckpt out/pythia410m/harmless/best_Harmless.pt \
-  --max_eval_samples 40 \
-  --attack_start 0 \
+CUDA_VISIBLE_DEVICES=2 python -m src.attack.eval_token_gcg_baseline \
+  --baseline_ckpt out/pythia410m/helpful/best_Helpful.pt \
+  --dataset AlignmentResearch/Helpful \
+  --split src/data/helpful_splits.json \
+  --max_eval_samples 100 \
   --n_attack_tokens 5 \
-  --beam_k 512 \
-  --rounds 20
+  --beam_k 256 \
+  --rounds 10
+  --attack_mode suffix \
+  --n_candidates_per_it 128 \
 '''
 
