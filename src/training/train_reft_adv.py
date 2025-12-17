@@ -79,6 +79,11 @@ def main():
             L = int(row["layer_idx"]); cfg.setdefault("model", {})["layer_idx"] = L
         if "attack_layer" in row and row["attack_layer"].strip() != "":
             A = int(row["attack_layer"]); cfg.setdefault("train", {})["attack_layer"] = A
+        
+        # 如果在做k的相关实验
+        if "gcg_steps" in row and row["gcg_steps"].strip() != "":
+            gcg_steps = int(row["gcg_steps"]); cfg.setdefault("train", {})["gcg_steps"] = gcg_steps
+        
         if "out_dir_tag" in row and row["out_dir_tag"].strip() != "":
             tag = row["out_dir_tag"].strip(); base_dir = cfg.get("out", {}).get("dir", "out")
             cfg.setdefault("out", {})["dir"] = os.path.join(base_dir, tag)
@@ -94,9 +99,10 @@ def main():
     layer_idx = cfg["model"]["layer_idx"]
     rank_r = cfg["model"]["rank_r"]
     att_layer = cfg["train"].get("attack_layer", layer_idx)
+    gcg_steps = cfg["train"].get("gcg_steps", 3)
     
     # [关键] 目录名必须包含 L 和 r, 供评估器解析
-    unique_tag = f"seed{run_seed}_R{r_mode}_L{layer_idx}_A{att_layer}_r{rank_r}_atk{inner_attack}_task{array_idx or 'local'}"
+    unique_tag = f"seed{run_seed}_gcgsteps{gcg_steps}_R{r_mode}_L{layer_idx}_A{att_layer}_r{rank_r}_atk{inner_attack}_task{array_idx or 'local'}"
     out_dir = os.path.join(out_root, unique_tag)
     os.makedirs(out_dir, exist_ok=True)
     print(f"[Train] 输出目录: {out_dir}")
@@ -117,6 +123,10 @@ def main():
 
     logger = hf_logging.get_logger(__name__)
     logger.info(f"Logging to {log_file}")
+    
+    logger.info("="*40)
+    logger.info(f"Final Configuration (Merged): \n{json.dumps(cfg, indent=2, default=str)}")
+    logger.info("="*40)
     
     # 训练时构建模型，和eval做区别
     device = cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")

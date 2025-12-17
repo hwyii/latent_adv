@@ -1,5 +1,5 @@
 from typing import Optional, Dict, Any
-import torch, pyreft
+import torch, pyreft, os, json
 from torch.nn import CrossEntropyLoss, MSELoss, BCEWithLogitsLoss
 from transformers import TrainingArguments
 from pyreft.reft_trainer import ReftTrainerForSequenceClassification, make_dataloader
@@ -107,7 +107,12 @@ class ReftAdversarialTrainerForSequenceClassification(ReftTrainerForSequenceClas
             step_size = 2.5 * (eps / max(1, steps)) # step size 设置为 eps 和 steps 比值 的 2.5 倍
         
             self.adv_intervention.reset_delta()
-        
+
+            # [新增] 准备一个列表来存当前 Batch 的攻击轨迹
+            # 仅在需要记录的 step 开启，避免 I/O 瓶颈
+            should_log_indices = (self.state.global_step % 10 == 0) # 每10个batch记录一次
+            batch_attack_trace = []
+            
             for t in range(steps):
                 intervenable.zero_grad()
 
@@ -136,10 +141,24 @@ class ReftAdversarialTrainerForSequenceClassification(ReftTrainerForSequenceClas
                     print("[PGD][ERROR] delta.grad is None, skip adversarial step")
                     break
                 
-                print(f"delta norm = {delta_tensor.norm().item():.4f}, step loss = {loss_step.item():.4f}")
+                #print(f"delta norm = {delta_tensor.norm().item():.4f}, step loss = {loss_step.item():.4f}")
 
                 with torch.no_grad():
                     g = delta_tensor.grad
+                    g_abs = g.abs().view(-1)
+                    
+                    top_vals, top_ids = g_abs.topk(50)
+                    mean_val = g_abs.mean()
+                    
+                    if t == 0: # 只看第一步
+                        print(f"Top-1 Gradient: {top_vals[0].item():.4f}")
+                        print(f"Top-32 Gradient: {top_vals[31].item():.4f}")
+                        print(f"Top-33 Gradient: {top_vals[32].item():.4f}") # 落选的第一名
+                        print(f"Average Gradient: {mean_val.item():.4f}")
+                        
+                        # 简单的比率检查
+                        ratio = top_vals[31] / (top_vals[32] + 1e-9)
+                        print(f"Dominance Ratio (Top32 / Rest): {ratio.item():.2f}")
                     
                     if cfg.inner_attack == "latent_pgd":
                         print("[inner attack] using latent_pgd")
@@ -151,7 +170,18 @@ class ReftAdversarialTrainerForSequenceClassification(ReftTrainerForSequenceClas
                         g_flat = g.view(-1)
                         k = min(cfg.gcg_topk, g_flat.numel())
                         
-                        topk_idx = g_flat.abs().topk(k=k).indices
+                        topk_obj = g_flat.abs().topk(k=k)
+                        topk_idx = topk_obj.indices
+                        
+                        # === [新增] 记录 indices ===
+                        if should_log_indices:
+                            # 必须转成 list 才能存 json
+                            # 记录由: (inner_step, indices_list) 组成
+                            ids_list = topk_idx.cpu().tolist()
+                            batch_attack_trace.append({
+                                "t": t,
+                                "ids": ids_list
+                            })
                         
                         delta_flat = delta_tensor.view(-1)
                         delta_flat[topk_idx] += step_size * g_flat[topk_idx].sign()
@@ -164,7 +194,18 @@ class ReftAdversarialTrainerForSequenceClassification(ReftTrainerForSequenceClas
                     delta_tensor.grad.zero_()
                     # 下一步继续对这个 delta 求梯度
                     delta_tensor.requires_grad_(True)
-                    
+            
+            if should_log_indices and len(batch_attack_trace) > 0:
+                log_path = os.path.join(self.args.output_dir, "attack_neurons_log.jsonl")
+                # 使用 'a' (append) 模式
+                with open(log_path, "a") as f:
+                    record = {
+                        "global_step": self.state.global_step,
+                        "trace": batch_attack_trace
+                    }
+                    f.write(json.dumps(record) + "\n")
+            
+            
             # 用最终的 delta 再 forward 一次，算真正的 adv_loss（对模型参数求梯度）
             if self.adv_intervention.delta is not None:
             # 防止再对 delta 求梯度：我们只想对参数求梯度
