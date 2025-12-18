@@ -118,7 +118,7 @@ def main():
     ap.add_argument("--split", type=str, default="attack", choices=["attack", "probe", "ft_train"])
     ap.add_argument("--max_eval", type=int, default=100)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--out_json", type=str, default="baseline/continuous_at/gcg_eval_results.jsonl")
+    ap.add_argument("--out_json", type=str, default="baseline/continuous_at/runs_harmless/gcg_eval_results.jsonl")
 
     # GCG params
     ap.add_argument("--attack_mode", type=str, default="suffix", choices=["suffix", "replace", "infix"])

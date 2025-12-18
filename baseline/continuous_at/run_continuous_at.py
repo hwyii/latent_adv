@@ -38,7 +38,7 @@ def main():
     ap.add_argument("--base_model_path", type=str, required=True)
     ap.add_argument("--model_pt", type=str, required=True)
 
-    ap.add_argument("--dataset", type=str, default="AlignmentResearch/Harmless")
+    ap.add_argument("--dataset", type=str, required=True)
     ap.add_argument("--splits_json", type=str, required=True)
 
     ap.add_argument("--output_dir", type=str, default="baseline/continuous_at/outputs")
@@ -117,12 +117,13 @@ def main():
 if __name__ == "__main__":
     main()
 
-"""CUDA_VISIBLE_DEVICES=1 python -m baseline.continuous_at.run_continuous_at \
+"""CUDA_VISIBLE_DEVICES=3 python -m baseline.continuous_at.run_continuous_at \
   --base_model_path EleutherAI/pythia-410m \
-  --model_pt out/pythia410m/harmless/best_Harmless.pt \
-  --splits_json src/data/harmless_splits.json \
-  --output_dir baseline/continuous_at/runs \
-  --seed 27 \
+  --model_pt out/pythia410m/helpful/best_Helpful.pt \
+  --dataset AlignmentResearch/Helpful \
+  --splits_json src/data/helpful_splits.json \
+  --output_dir baseline/continuous_at/runs_helpful \
+  --seed 42 \
   --mix_adv_frac 0.5 \
   --batch_size 8 --max_steps 1500
 """
