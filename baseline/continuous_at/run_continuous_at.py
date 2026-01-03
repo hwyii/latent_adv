@@ -40,7 +40,6 @@ def main():
 
     ap.add_argument("--dataset", type=str, required=True)
     ap.add_argument("--splits_json", type=str, required=True)
-
     ap.add_argument("--output_dir", type=str, default="baseline/continuous_at/outputs")
 
     ap.add_argument("--seed", type=int, default=0)
@@ -61,6 +60,12 @@ def main():
     ap.add_argument("--weight_decay", type=float, default=0.0)
     ap.add_argument("--log_every", type=int, default=50)
 
+    # FLOPs profiling
+    ap.add_argument("--profile_flops_steps", type=int, default=0,
+                    help="Profile FLOPs for the first N steps (0 disables)")
+    ap.add_argument("--profile_flops_every", type=int, default=1,
+                    help="Profile FLOPs every k steps within the profiled window")
+
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -70,10 +75,9 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_model_path, use_fast=True)
     config = AutoConfig.from_pretrained(args.base_model_path)
-    model = AutoModelForSequenceClassification.from_pretrained(args.base_model_path, config=config)
+    model = AutoModelForSequenceClassification.from_pretrained(args.base_model_path, config=config, attn_implementation="eager")
 
     load_state_dict_into_model(model, args.model_pt)
-
     model.to(device)
 
     # load data + splits
@@ -87,7 +91,10 @@ def main():
 
     train_items = [{"content": ds[i]["content"], "clf_label": int(ds[i]["clf_label"])} for i in ft_train_idx]
 
-    out_dir = os.path.join(args.output_dir, f"eps{args.eps}_k{args.k}_{args.norm}_mix{args.mix_adv_frac}_seed{args.seed}")
+    out_dir = os.path.join(
+        args.output_dir,
+        f"flops_eps{args.eps}_k{args.k}_{args.norm}_mix{args.mix_adv_frac}_seed{args.seed}",
+    )
     os.makedirs(out_dir, exist_ok=True)
 
     attack_cfg = AttackConfig(
@@ -111,19 +118,26 @@ def main():
         max_steps=args.max_steps,
         weight_decay=args.weight_decay,
         log_every=args.log_every,
+        profile_flops_steps=args.profile_flops_steps,
+        profile_flops_every=args.profile_flops_every,
     )
 
 
 if __name__ == "__main__":
     main()
 
-"""CUDA_VISIBLE_DEVICES=3 python -m baseline.continuous_at.run_continuous_at \
+
+"""CUDA_VISIBLE_DEVICES=2 python -m baseline.continuous_at.run_continuous_at \
   --base_model_path EleutherAI/pythia-410m \
-  --model_pt out/pythia410m/helpful/best_Helpful.pt \
-  --dataset AlignmentResearch/Helpful \
-  --splits_json src/data/helpful_splits.json \
-  --output_dir baseline/continuous_at/runs_helpful \
+  --model_pt out/pythia410m/imdb/best_IMDB.pt \
+  --dataset AlignmentResearch/IMDB \
+  --splits_json src/data/imdb_splits.json \
+  --output_dir baseline/continuous_at/runs_imdb \
   --seed 42 \
+  --eps 0.05 \
+  --k 10 \
   --mix_adv_frac 0.5 \
-  --batch_size 8 --max_steps 1500
+  --batch_size 8 --max_steps 1500 \
+  --profile_flops_steps 20 \
+  --profile_flops_every 5
 """

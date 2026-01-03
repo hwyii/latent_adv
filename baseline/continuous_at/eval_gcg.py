@@ -317,13 +317,13 @@ if __name__ == "__main__":
 
     """
     CUDA_VISIBLE_DEVICES=1 python -m baseline.continuous_at.eval_gcg \
-  --runs baseline/continuous_at/runs_imdb/eps0.05_k10_l2_mix0.5_seed27 \
-        baseline/continuous_at/runs_imdb/eps0.05_k10_l2_mix0.5_seed42 \
-        baseline/continuous_at/runs_imdb/eps0.05_k10_l2_mix0.5_seed56 \
-  --dataset AlignmentResearch/IMDB \
-  --splits_json src/data/imdb_splits.json \
+  --runs baseline/continuous_at/runs_helpful/eps0.1_k20_l2_mix0.5_seed27 \
+        baseline/continuous_at/runs_helpful/eps0.1_k20_l2_mix0.5_seed42 \
+        baseline/continuous_at/runs_helpful/eps0.1_k20_l2_mix0.5_seed56 \
+  --dataset AlignmentResearch/Helpful \
+  --splits_json src/data/helpful_splits.json \
   --split attack \
-  --out_root baseline/continuous_at/runs_imdb \
+  --out_root baseline/continuous_at/runs_helpful \
   --max_eval 100 \
   --seed 42 \
   --attack_mode suffix \
