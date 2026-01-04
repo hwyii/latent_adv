@@ -19,7 +19,7 @@ def gcg_attack_text(
     beam_k: int = 256,
     n_candidates_per_it: int = 128,
     max_length: int = 512,
-) -> Tuple[str, float, bool]:
+) -> Tuple[str, float, bool, int, int, int]:
     """
     Convenience wrapper: raw text -> attacked text
     Returns: (attacked_text, adv_loss, success)
@@ -28,7 +28,7 @@ def gcg_attack_text(
     input_ids = enc["input_ids"][0]
     attention_mask = enc["attention_mask"][0]
 
-    _, _, _, adv_loss, success, adv_ids = token_level_gcg_single_baseline(
+    _, _, _, adv_loss, success, adv_ids, n_forward, n_backward, D_tokens = token_level_gcg_single_baseline(
         model=model,
         tokenizer=tokenizer,
         input_ids=input_ids,
@@ -43,4 +43,4 @@ def gcg_attack_text(
         n_candidates_per_it=n_candidates_per_it,
     )
     adv_text = tokenizer.decode(adv_ids, skip_special_tokens=True)
-    return adv_text, float(adv_loss), bool(success)
+    return adv_text, float(adv_loss), bool(success), int(n_forward), int(n_backward), int(D_tokens)

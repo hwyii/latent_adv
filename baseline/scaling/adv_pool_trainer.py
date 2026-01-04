@@ -4,10 +4,16 @@ from typing import List, Dict, Any, Tuple
 import os
 import random
 import numpy as np
+from deepspeed.profiling.flops_profiler import FlopsProfiler
 
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import AdamW, get_linear_schedule_with_warmup
+def count_params(model) -> int:
+    return sum(p.numel() for p in model.parameters())
+
+def kaplan_cost_from_passes(N: int, D_tokens: int, n_forward: int, n_backward: int) -> float:
+    return (2.0 * n_forward + 4.0 * n_backward) * float(N) * float(D_tokens)
 
 
 @dataclass
@@ -124,16 +130,27 @@ def build_round_items(
 def train_one_round(
     model,
     tokenizer,
-    round_items: List[Dict[str, Any]],
-    device: torch.device,
-    lr: float,
-    batch_size: int,
-    max_steps: int,
-    weight_decay: float,
-    save_dir: str,
-    round_id: int,
+    round_items,
+    device,
+    lr,
+    batch_size,
+    max_steps,
+    weight_decay,
+    save_dir,
+    round_id,
+    kaplan_N_params: int = None,
+    profile_flops_steps: int = 0,
+    profile_flops_every: int = 1,
 ):
+
     model.train()
+    if kaplan_N_params is None:
+        kaplan_N_params = count_params(model)
+
+    kaplan_Ctrain_round = 0.0
+    kaplan_Dtrain_round = 0
+    flops_records = []
+
     ds = SimpleTextClsDataset(round_items, tokenizer=tokenizer, max_length=512)
     collate = make_collate_fn(tokenizer.pad_token_id)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True, collate_fn=collate)
@@ -146,9 +163,33 @@ def train_one_round(
     while step < max_steps:
         for batch in dl:
             batch = {k: v.to(device) for k, v in batch.items()}
-            out = model(**batch)
+            D_batch = int(batch["attention_mask"].sum().item())
+
+            do_profile = (
+                profile_flops_steps > 0
+                and step < profile_flops_steps
+                and profile_flops_every > 0
+                and (step % profile_flops_every) == 0
+            )
+            profiler = None
+            if do_profile:
+                profiler = FlopsProfiler(model)
+                profiler.start_profile()
+
+            out = model(**batch)   # 1 forward
             loss = out.loss
-            loss.backward()
+            loss.backward()        # 1 backward (to params)
+
+            if do_profile and profiler is not None:
+                profiler.stop_profile()
+                flops_step = profiler.get_total_flops(as_string=False)
+                flops_records.append(float(flops_step))
+                profiler.end_profile()
+
+            # Kaplan train compute: 1F + 1B
+            kaplan_Ctrain_round += kaplan_cost_from_passes(kaplan_N_params, D_batch, 1, 1)
+            kaplan_Dtrain_round += D_batch
+
             optim.step()
             sched.step()
             optim.zero_grad(set_to_none=True)
@@ -161,4 +202,17 @@ def train_one_round(
     os.makedirs(ckpt_dir, exist_ok=True)
     model.save_pretrained(ckpt_dir)
     tokenizer.save_pretrained(ckpt_dir)
-    return ckpt_dir
+    round_compute = {
+        "round": int(round_id),
+        "kaplan_N_params": int(kaplan_N_params),
+        "kaplan_Ctrain_round": float(kaplan_Ctrain_round),
+        "kaplan_Dtrain_round_tokens": int(kaplan_Dtrain_round),
+        "ds_prof_n": int(len(flops_records)),
+        "ds_prof_flops_step_mean": (float(sum(flops_records) / len(flops_records)) if len(flops_records) else None),
+    }
+    with open(os.path.join(save_dir, f"round_{round_id:03d}_train_compute.json"), "w") as f:
+        import json
+        json.dump(round_compute, f, indent=2)
+
+    return ckpt_dir, round_compute
+
