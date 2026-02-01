@@ -1,18 +1,13 @@
+# 只保留默认参数，运行时被run_all_experiments.py中的param_grid覆盖
 device: "cuda" 
 
 model:
   model_name: "EleutherAI/pythia-410m"
-  load_baseline_ckpt: "out/pythia410m/harmless/best_Harmless.pt"
-  layer_idx: 15
   rank_r: 4
   max_length: 512
   position: "l1"
   
-
 data:
-  split_file: "src/data/harmless_splits.json"
-  train_split: "ft_train" 
-  dataset: "AlignmentResearch/Harmless"
   input_field: "content"
   label_field: "clf_label"
 
@@ -23,26 +18,29 @@ train:
   lr_all: 0.0001
   weight_decay: 0.01
   epochs: 3
-  seed: 42
-  r_init_mode: "random"
+  seed: 42 
+  r_init_mode: "random" # 区分初始化方法和后面的inner attack方法
 
   lambda_adv: 0.5
-  attack_layer: 2
-  inner_attack: "latent_pgd" 
-  eps_r: 0.05
-  gcg_steps: 3
-  gcg_topk: 2
-  gcg_alpha: null # 用默认eps/steps
+  attack_layer: 13
+  inner_attack: "latent_gcg_coord" # latent_pgd | latent_gcg_coord
+  eps_r: 0.05 # PGD和GCG共享此参数
+  gcg_steps: 1 # PGD和GCG共享此参数
+  gcg_topk: 32
   
   logging_steps: 50
   evaluation_strategy: "epoch"
   save_strategy: "epoch"
-  save_total_limit: 2
+  save_total_limit: 1
 
   # early stopping
   early_stopping_patience: 1
   early_stopping_threshold: 0.0
 
+  # circuit gate相关配置
+  use_circuit_gate: true # 默认开启，可在param_grid中关闭
+  gate_mode: inner_only
+  circuit_top_k: 20
 
   # wandb配置
   use_wandb: false
@@ -51,5 +49,5 @@ train:
   wandb_run_name: "reft_latent_adv_pythia410m_harmless"
 
 out:
-  dir: "out/pythia410m/harmless/reft_latent_adv"
+  dir: "outputs/debug_default" # 留一个默认值防止报错，但实际会被覆盖
 

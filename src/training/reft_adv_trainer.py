@@ -1,25 +1,31 @@
+# src/training/reft_adv_trainer.py
 from typing import Optional, Dict, Any
-import torch, pyreft, os, json
-from torch.nn import CrossEntropyLoss, MSELoss, BCEWithLogitsLoss
-from transformers import TrainingArguments
-from pyreft.reft_trainer import ReftTrainerForSequenceClassification, make_dataloader
+import os, json
+import torch
+import pyreft
 import pyvene as pv
+
+from torch.nn import CrossEntropyLoss, MSELoss, BCEWithLogitsLoss
+from pyreft.reft_trainer import ReftTrainerForSequenceClassification, make_dataloader
 from transformers.trainer_utils import EvalPrediction, has_length, denumpify_detensorize
 from transformers.utils import logging
-import pdb
-logger = logging.get_logger(__name__)
 
 from src.attack.inner_attack import AttackConfig
 from src.models.adv_intervention import AdversarialIntervention
 
+from src.circuit.circuit_mask import load_circuit_mask, mask_summary
+from src.circuit.grad_gate import CircuitGradGate  # optional (focus grad slices)
+from src.models.circuitable_attention import make_circuitable_neox, set_circuit_on_model
 
-    
+logger = logging.get_logger(__name__)
+
+
 class ReftAdversarialTrainerForSequenceClassification(ReftTrainerForSequenceClassification):
-    # 继承父类并重写compute_loss
     def __init__(self, *args, attack_config: Optional[AttackConfig] = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.attack_config = attack_config
-        # --- 找出我们刚才挂上的 AdversarialIntervention ---
+
+        # --- find AdversarialIntervention ---
         self.adv_intervention = None
         for k, v in self.model.interventions.items():
             if isinstance(v, AdversarialIntervention):
@@ -34,56 +40,103 @@ class ReftAdversarialTrainerForSequenceClassification(ReftTrainerForSequenceClas
             logger.info(f"[AdvTrainer] adversarial training enabled: {self.attack_config.inner_attack}")
         else:
             logger.info("[AdvTrainer] adversarial training disabled.")
-        
+
+        # ===== circuit setup =====
+        self.circuit_spec = None
+        self.circuit_gate = None   # optional grad slice gate (not for FLOPs)
+        self._base_model = None
+        self._circuit_mask_cpu = None
+
+        cfg = self.attack_config
+        if cfg is not None and getattr(cfg, "use_circuit_gate", False):
+            if not getattr(cfg, "circuit_path", None):
+                raise ValueError("use_circuit_gate=True but circuit_path is None")
+
+            base = self.model.model  # HF base model inside IntervenableModel
+            self._base_model = base
+
+            if not hasattr(base, "gpt_neox"):
+                raise ValueError("Circuit gate currently supports GPT-NeoX/Pythia (model.gpt_neox.layers).")
+
+            num_layers = len(base.gpt_neox.layers)
+            num_heads = base.gpt_neox.config.num_attention_heads
+            head_dim = base.gpt_neox.config.hidden_size // num_heads
+
+            # IMPORTANT: your load_circuit_mask() does NOT accept top_k kwarg in your pasted version.
+            # Use JSON's own "top_k" or pre-trim the list in JSON.
+            spec = load_circuit_mask(
+                json_path=cfg.circuit_path,
+                num_layers=num_layers,
+                num_heads=num_heads,
+                device=None,
+            )
+            total, per_layer = mask_summary(spec.mask)
+            logger.info(f"[Circuit] loaded {cfg.circuit_path} | total_heads={total} | layers={len(per_layer)}")
+
+            self.circuit_spec = spec
+            self._circuit_mask_cpu = spec.mask.detach().cpu()  # bool [L,H]
+
+            # 1) install forward-time stopgrad hooks once
+            make_circuitable_neox(base)
+            # default OFF
+            set_circuit_on_model(base, None, enabled=False)
+
+            # 2) optional: gradient slice gate (does not reduce FLOPs, just focus grads)
+            #    If you want pure FLOPs saving only, you can comment this out.
+            self.circuit_gate = CircuitGradGate(
+                model=base,
+                head_mask=spec.mask,
+                head_dim=head_dim,
+                enabled=True,
+                verbose=False,
+            )
+
     def compute_loss(
         self,
         intervenable: pv.IntervenableModel,
         inputs: Dict[str, torch.Tensor],
         return_outputs: bool = False,
     ):
-        #print("[Debug] dim labels:", inputs["labels"].dim())
-        if inputs["labels"].dim() == 2:  
-            inputs["labels"] = inputs["labels"].squeeze(1) 
-        #print("[Debug] labels after squeeze:", inputs["labels"]) 
-        """
-        重写 compute_loss：
-        1) 复制 ReftTrainer 的 clean loss 逻辑
-        2) 添加 latent adv loss
-        """
-        # clean forward (原始pyreft逻辑)
-        # run intervened forward pass
+        # labels shape fix
+        if inputs["labels"].dim() == 2:
+            inputs["labels"] = inputs["labels"].squeeze(1)
+
+        # unit_locations
         unit_locations = None
         if "intervention_locations" in inputs:
-            unit_locations={"sources->base": (
-                None,
-                inputs["intervention_locations"].permute(1, 0, 2).tolist()
-            )}
-        # --------- 1. clean loss：确保 adv_intervention 不加扰动 ---------
+            unit_locations = {
+                "sources->base": (
+                    None,
+                    inputs["intervention_locations"].permute(1, 0, 2).tolist()
+                )
+            }
+
+        # -------- 1) clean forward (no delta) --------
         if self.adv_intervention is not None:
             self.adv_intervention.reset_delta()
+
         _, cf_outputs = intervenable(
-            {
-                "input_ids": inputs["input_ids"],
-                "attention_mask": inputs["attention_mask"]
-            },
+            {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]},
             unit_locations=unit_locations,
             labels=inputs["labels"],
             subspaces=inputs["subspaces"].permute(1, 0, 2).tolist() if "subspaces" in inputs else None
         )
-        # classification loss on counterfactual labels
+
         logits = cf_outputs.logits
         labels = inputs["labels"]
 
+        # problem type
         if self.model.model.config.problem_type is None:
             if self.model.model.num_labels == 1:
                 problem_type = "regression"
-            elif self.model.model.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
+            elif self.model.model.num_labels > 1 and (labels.dtype in (torch.long, torch.int)):
                 problem_type = "single_label_classification"
             else:
                 problem_type = "multi_label_classification"
         else:
             problem_type = self.model.model.config.problem_type
-            
+
+        # clean loss
         if problem_type == "regression":
             loss_fct = MSELoss()
             if self.model.model.num_labels == 1:
@@ -93,130 +146,168 @@ class ReftAdversarialTrainerForSequenceClassification(ReftTrainerForSequenceClas
         elif problem_type == "single_label_classification":
             loss_fct = CrossEntropyLoss()
             clean_loss = loss_fct(logits.view(-1, self.model.model.num_labels), labels.view(-1))
-        elif problem_type == "multi_label_classification":
+        else:
             loss_fct = BCEWithLogitsLoss()
             clean_loss = loss_fct(logits, labels)
+
         total_loss = clean_loss
         adv_loss = None
-        #pdb.set_trace()
-        # --------- 2. latent adv loss：在 adv_intervention 上加扰动 ---------
+
+        # -------- 2) inner adversarial loop (build delta) --------
         cfg = self.attack_config
         if cfg is not None and cfg.inner_attack != "none":
-            steps = cfg.steps
-            eps = cfg.eps
-            step_size = 2.5 * (eps / max(1, steps)) # step size 设置为 eps 和 steps 比值 的 2.5 倍
-        
-            self.adv_intervention.reset_delta()
-
-            # [新增] 准备一个列表来存当前 Batch 的攻击轨迹
-            # 仅在需要记录的 step 开启，避免 I/O 瓶颈
-            should_log_indices = (self.state.global_step % 10 == 0) # 每10个batch记录一次
-            batch_attack_trace = []
+            # random noise delta
+            if cfg.inner_attack == "random_noise":
             
-            for t in range(steps):
-                intervenable.zero_grad()
-
-                # forward：此时 AdversarialIntervention.forward 会：
-                #   - 发现 self.delta is None -> 初始化为 zeros_like(base) 可导
-                #   - 下一步再 forward 时，沿用同一个 delta
-                _, cf_adv = intervenable(
-                    {
-                        "input_ids": inputs["input_ids"],
-                        "attention_mask": inputs["attention_mask"]
-                    },
-                    unit_locations=unit_locations,
-                    labels=labels,
-                )
-                logits_adv = cf_adv.logits
-                loss_step = CrossEntropyLoss()(
-                logits_adv.view(-1, self.model.model.num_labels),
-                    labels.view(-1)
-                )
-
-                loss_step.backward()
-
-                # 关键：现在 graph 里的是 self.adv_intervention.delta，而不是外面一个局部 delta
-                delta_tensor = self.adv_intervention.delta
-                if delta_tensor is None or delta_tensor.grad is None:
-                    print("[PGD][ERROR] delta.grad is None, skip adversarial step")
-                    break
+                current_delta = self.adv_intervention.delta
+                if current_delta is None:
+                    # 如果 clean forward 没生成 delta (某些特定的 reft 配置)，需要特殊处理
+                    # 这里假设它不为 None
+                    pass
+                else:
+                    eps = float(cfg.eps)
+                    
+                    # 生成随机噪声
+                    # 方式 A: 均匀分布 U[-eps, eps]
+                    noise = torch.rand_like(current_delta) * 2 * eps - eps
+                    
+                    # 方式 B: 高斯噪声并截断 (更猛一点)
+                    # noise = torch.randn_like(current_delta)
+                    # noise = noise / (noise.norm(p=2, dim=-1, keepdim=True) + 1e-10) * eps
+                    
+                    # 应用噪声
+                    # 注意：PyReFT 的 delta 通常是 Parameter 或 Tensor，若是 Parameter 需用 data
+                    with torch.no_grad():
+                        current_delta.add_(noise)
+                        # 再次做 clamp 确保不越界 (如果是针对 norm 的限制)
+                        current_delta.clamp_(-eps, eps)
                 
-                #print(f"delta norm = {delta_tensor.norm().item():.4f}, step loss = {loss_step.item():.4f}")
+                # Random 模式不需要 steps 循环，一次即可
+                # 但为了代码兼容性，我们直接跳过下面的 for t in range(steps) 
+                
+            else:
+            
+                steps = int(cfg.steps)
+                eps = float(cfg.eps)
+                step_size = 2.5 * (eps / max(1, steps))
 
-                with torch.no_grad():
-                    g = delta_tensor.grad
-                    g_abs = g.abs().view(-1)
+                self.adv_intervention.reset_delta()
+
+                should_log_indices = (self.state.global_step % 10 == 0)
+                batch_attack_trace = []
+
+                # enable stopgrad gate only for inner loop
+                gate_mode = getattr(cfg, "gate_mode", "inner_only")
+                do_stopgrad_inner = (
+                    self.circuit_spec is not None and gate_mode in ("inner_only", "inner+final")
+                )
+                if do_stopgrad_inner:
+                    set_circuit_on_model(self._base_model, self._circuit_mask_cpu, enabled=True)
+
+                try:
                     
-                    top_vals, top_ids = g_abs.topk(50)
-                    mean_val = g_abs.mean()
-                    
-                    if t == 0: # 只看第一步
-                        print(f"Top-1 Gradient: {top_vals[0].item():.4f}")
-                        print(f"Top-32 Gradient: {top_vals[31].item():.4f}")
-                        print(f"Top-33 Gradient: {top_vals[32].item():.4f}") # 落选的第一名
-                        print(f"Average Gradient: {mean_val.item():.4f}")
-                        
-                        # 简单的比率检查
-                        ratio = top_vals[31] / (top_vals[32] + 1e-9)
-                        print(f"Dominance Ratio (Top32 / Rest): {ratio.item():.2f}")
-                    
-                    if cfg.inner_attack == "latent_pgd":
-                        print("[inner attack] using latent_pgd")
-                        # PGD update, 所有坐标全维 sign update
-                        delta_tensor.add_(step_size * g.sign())
-                    elif cfg.inner_attack == "latent_gcg_coord":
-                        # GCG coordinate update, 每次只更新|grad|最大的top-k维
-                        print("[inner attack] using latent_gcg_coord")
-                        g_flat = g.view(-1)
-                        k = min(cfg.gcg_topk, g_flat.numel())
-                        
-                        topk_obj = g_flat.abs().topk(k=k)
-                        topk_idx = topk_obj.indices
-                        
-                        # === [新增] 记录 indices ===
-                        if should_log_indices:
-                            # 必须转成 list 才能存 json
-                            # 记录由: (inner_step, indices_list) 组成
-                            ids_list = topk_idx.cpu().tolist()
-                            batch_attack_trace.append({
-                                "t": t,
-                                "ids": ids_list
-                            })
-                        
-                        delta_flat = delta_tensor.view(-1)
-                        delta_flat[topk_idx] += step_size * g_flat[topk_idx].sign()
-                        
-                    else:
-                        raise ValueError(f"Unknown inner_attack type: {cfg.inner_attack}")
-                        
-                    
-                    delta_tensor.clamp_(-eps, eps)
-                    delta_tensor.grad.zero_()
-                    # 下一步继续对这个 delta 求梯度
-                    delta_tensor.requires_grad_(True)
-            
-            if should_log_indices and len(batch_attack_trace) > 0:
-                log_path = os.path.join(self.args.output_dir, "attack_neurons_log.jsonl")
-                # 使用 'a' (append) 模式
-                with open(log_path, "a") as f:
-                    record = {
-                        "global_step": self.state.global_step,
-                        "trace": batch_attack_trace
-                    }
-                    f.write(json.dumps(record) + "\n")
-            
-            
-            # 用最终的 delta 再 forward 一次，算真正的 adv_loss（对模型参数求梯度）
+
+                    for t in range(steps):
+                        if do_stopgrad_inner and t == 0:
+                            print(f"[DEBUG] stopgrad gate ENABLED at global_step={self.state.global_step}")
+                        intervenable.zero_grad()
+
+                        _, cf_adv = intervenable(
+                            {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]},
+                            unit_locations=unit_locations,
+                            labels=labels,
+                        )
+                        logits_adv = cf_adv.logits
+                        loss_step = CrossEntropyLoss()(
+                            logits_adv.view(-1, self.model.model.num_labels),
+                            labels.view(-1)
+                        )
+
+                        # optional grad slice gate (focus only; not FLOPs saving)
+                        do_grad_mask_inner = (
+                            self.circuit_gate is not None and gate_mode in ("inner_only", "inner+final")
+                        )
+                        if do_grad_mask_inner:
+                            with self.circuit_gate:
+                                loss_step.backward()
+                        else:
+                            loss_step.backward()
+
+                        # Debug point 3: inspect dense input-gradient sparsity after backward
+                        if t == 0 and (self.state.global_step % 50 == 0):
+                            try:
+                                base = self._base_model
+                                layer = 13
+                                dense = base.gpt_neox.layers[layer].attention.dense
+
+                                gW = dense.weight.grad
+                                if gW is None:
+                                    print("[DEBUG] dense.weight.grad is None")
+                                else:
+                                    head_mask = self._circuit_mask_cpu[layer].to(gW.device)  # [H]
+                                    num_heads = base.gpt_neox.config.num_attention_heads
+                                    head_dim = base.gpt_neox.config.hidden_size // num_heads
+
+                                    keep_cols = torch.zeros(num_heads * head_dim, dtype=torch.bool, device=gW.device)
+                                    for h in range(num_heads):
+                                        if head_mask[h]:
+                                            keep_cols[h*head_dim:(h+1)*head_dim] = True
+
+                                    cols_keep = gW[:, keep_cols].abs().mean().item()
+                                    cols_drop = gW[:, ~keep_cols].abs().mean().item()
+                                    print(f"[DEBUG] layer{layer} dense.grad mean keep={cols_keep:.4e} drop={cols_drop:.4e}")
+                            except Exception as e:
+                                print("[DEBUG] grad-inspect error:", e)
+
+                        delta_tensor = self.adv_intervention.delta
+                        if delta_tensor is None or delta_tensor.grad is None:
+                            print("[InnerAttack][ERROR] delta.grad is None, abort inner loop")
+                            break
+
+                        with torch.no_grad():
+                            g = delta_tensor.grad
+
+                            if cfg.inner_attack == "latent_pgd":
+                                delta_tensor.add_(step_size * g.sign())
+
+                            elif cfg.inner_attack == "latent_gcg_coord":
+                                g_flat = g.view(-1)
+                                k = min(int(getattr(cfg, "gcg_topk", 2)), g_flat.numel())
+
+                                topk_idx = g_flat.abs().topk(k=k).indices
+
+                                if should_log_indices:
+                                    batch_attack_trace.append({"t": t, "ids": topk_idx.detach().cpu().tolist()})
+
+                                delta_flat = delta_tensor.view(-1)
+                                delta_flat[topk_idx] += step_size * g_flat[topk_idx].sign()
+
+                            else:
+                                raise ValueError(f"Unknown inner_attack type: {cfg.inner_attack}")
+
+                            delta_tensor.clamp_(-eps, eps)
+                            delta_tensor.grad.zero_()
+                            delta_tensor.requires_grad_(True)
+
+                finally:
+                    if do_stopgrad_inner:
+                        set_circuit_on_model(self._base_model, None, enabled=False)
+                        print(f"[DEBUG] stopgrad gate DISABLED at global_step={self.state.global_step}")
+
+
+                if should_log_indices and len(batch_attack_trace) > 0:
+                    log_path = os.path.join(self.args.output_dir, "attack_neurons_log.jsonl")
+                    with open(log_path, "a") as f:
+                        f.write(json.dumps({"global_step": self.state.global_step, "trace": batch_attack_trace}) + "\n")
+
+            # -------- 3) final adversarial loss (update ReFT params) --------
             if self.adv_intervention.delta is not None:
-            # 防止再对 delta 求梯度：我们只想对参数求梯度
                 self.adv_intervention.delta = self.adv_intervention.delta.detach()
                 intervenable.zero_grad()
 
+                # Option A (recommended): final backward NOT gated (base frozen anyway, only ReFT grads)
                 _, cf_final = intervenable(
-                    {
-                        "input_ids": inputs["input_ids"],
-                        "attention_mask": inputs["attention_mask"]
-                    },
+                    {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]},
                     unit_locations=unit_locations,
                     labels=labels,
                 )
@@ -226,130 +317,90 @@ class ReftAdversarialTrainerForSequenceClassification(ReftTrainerForSequenceClas
                     labels.view(-1)
                 )
 
-                # 用完之后可以重置，避免下一 batch 残留
                 self.adv_intervention.reset_delta()
+                total_loss = clean_loss + float(cfg.lambda_adv) * adv_loss
 
-                total_loss = clean_loss + cfg.lambda_adv * adv_loss
-
-        if (self.state.is_world_process_zero
-                and self.state.global_step > 0
-                and self.state.global_step % self.args.logging_steps == 0):
-                
-                log_dict = {"loss_clean": clean_loss.item()}
-                if adv_loss is not None:
-                    log_dict["loss_adv"] = adv_loss.item()
-                    log_dict["loss_total"] = total_loss.item()
-                self.log(log_dict)
+        # logging
+        if (
+            self.state.is_world_process_zero
+            and self.state.global_step > 0
+            and self.state.global_step % self.args.logging_steps == 0
+        ):
+            log_dict = {"loss_clean": clean_loss.item()}
+            if adv_loss is not None:
+                log_dict["loss_adv"] = adv_loss.item()
+                log_dict["loss_total"] = total_loss.item()
+            self.log(log_dict)
 
         if return_outputs:
             cf_outputs.loss = total_loss
             return (total_loss, cf_outputs)
         return total_loss
-    
-    def evaluate(self, eval_dataset = None, ignore_keys = None, metric_key_prefix: str = "eval"):
-        """
-        重写 evaluate：评估前重置 adv_intervention 的 delta
-        兼容 ReftConfig 里的 adversarial intervention
-        """
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix: str = "eval"):
         if eval_dataset is None:
             eval_dataset = self.eval_dataset
-        
-        # base classifier eval 模式
+
         self.model.model.eval()
         for k, v in self.model.interventions.items():
-            # 兼容两种结构：v 是单个 intervention 或 list[intervention]
             if isinstance(v, (list, tuple)):
                 for mod in v:
                     mod.eval()
             else:
                 v.eval()
-        # 如果有 adversarial intervention，把 delta 清掉，防止 eval 时加扰动
+
         if getattr(self, "adv_intervention", None) is not None:
             self.adv_intervention.reset_delta()
-            
-        # -------- 1. 构建 dataloader --------
-        batch_size = self.args.eval_batch_size
-        data_collator = self.data_collator
-        intervenable = self.model
 
-        dataloader = make_dataloader(
-            eval_dataset,
-            batch_size,
-            data_collator,
-            shuffle=False
-        )
-        
+        batch_size = self.args.eval_batch_size
+        dataloader = make_dataloader(eval_dataset, batch_size, self.data_collator, shuffle=False)
+
         logger.info("***** Running In-Training Evaluation *****")
         if has_length(dataloader):
             logger.info(f"  Num examples = {self.num_examples(dataloader)}")
-        else:
-            logger.info("  Num examples: Unknown")
         logger.info(f"  Batch size = {batch_size}")
+
         from tqdm.auto import tqdm
         eval_iterator = tqdm(dataloader, position=0, leave=True)
 
-        all_preds = []
-        all_labels = []
-
+        all_preds, all_labels = [], []
         device = self.model.get_device()
 
         with torch.no_grad():
             for step, inputs in enumerate(eval_iterator):
-                # 把 batch 搬到正确 device
                 for k, v in inputs.items():
                     if v is not None and isinstance(v, torch.Tensor):
                         inputs[k] = v.to(device)
 
-                # 构造 unit_locations（和 compute_loss 里保持一致）
                 unit_locations = None
                 if "intervention_locations" in inputs:
-                    # inputs["intervention_locations"]: [B, L, P]
-                    # 需要变成 [L, B, P]
-                    intervention_locations = (
-                        inputs["intervention_locations"].permute(1, 0, 2).tolist()
-                    )
-                    unit_locations = {
-                        "sources->base": (None, intervention_locations)
-                    }
+                    intervention_locations = inputs["intervention_locations"].permute(1, 0, 2).tolist()
+                    unit_locations = {"sources->base": (None, intervention_locations)}
 
-                # forward：这里只做“正常 ReFT”，不加 adversarial delta
                 if getattr(self, "adv_intervention", None) is not None:
                     self.adv_intervention.reset_delta()
 
-                _, cf_outputs = intervenable(
-                    {
-                        "input_ids": inputs["input_ids"],
-                        "attention_mask": inputs["attention_mask"],
-                    },
+                _, cf_outputs = self.model(
+                    {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]},
                     unit_locations=unit_locations,
                     labels=inputs["labels"],
                 )
 
                 all_preds.append(cf_outputs.logits)
                 all_labels.append(inputs["labels"])
-        #pdb.set_trace()
-        # -------- 3. 汇总 + 调用 compute_metrics --------
+
         all_preds = torch.cat(all_preds, dim=0).cpu().to(torch.float32)
         all_labels = torch.cat(all_labels, dim=0).cpu().to(torch.float32)
 
-        metrics = self.compute_metrics(
-            EvalPrediction(predictions=all_preds, label_ids=all_labels)
-        )
+        metrics = self.compute_metrics(EvalPrediction(predictions=all_preds, label_ids=all_labels))
         metrics = denumpify_detensorize(metrics)
 
-        # 对 key 加上 "eval_" 前缀（和原版一样）
         for key in list(metrics.keys()):
             if not key.startswith(f"{metric_key_prefix}_"):
                 metrics[f"{metric_key_prefix}_{key}"] = metrics.pop(key)
 
-        # 日志 + callbacks
         self.log(metrics)
-        self.control = self.callback_handler.on_evaluate(
-            self.args, self.state, self.control, metrics
-        )
+        self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
         self._memory_tracker.stop_and_update_metrics(metrics)
 
         return metrics
-        
-        
-        
