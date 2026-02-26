@@ -6,7 +6,7 @@ from multiprocessing import Pool, Manager
 # ================= 配置区 =================
 
 # 1. 可用 GPU
-GPUS = [2, 2, 2, 2]
+GPUS = [1]
 MAX_WORKERS = len(GPUS) # 并行任务数
 
 # 2. 定义你要跑的 3 个数据集
@@ -15,33 +15,33 @@ DATASETS = {
         "path": "AlignmentResearch/Helpful",
         "split_file": "src/data/helpful_splits.json",
         "train_split": "ft_train",
-        "ckpt": "out/pythia410m/helpful/best_Helpful.pt",
-        "circuit_base": "analysis/helpful_train_circuit" 
+        "ckpt": "outputs_gpt2_baseline/helpful/best_Helpful.pt",
+        #"circuit_base": "analysis/helpful_train_circuit" 
     },
     # "Harmless": {
     #     "path": "AlignmentResearch/Harmless",
     #     "split_file": "src/data/harmless_splits.json",
     #     "train_split": "ft_train",
-    #     "ckpt": "out/pythia410m/harmless/best_Harmless.pt",
-    #     "circuit_base": "analysis/harmless_train_circuit"
+    #     "ckpt": "outputs_gpt2_baseline/harmless/best_Harmless.pt",
+    #     #"circuit_base": "analysis/harmless_train_circuit"
     # },
-    "IMDB": {
-        "path": "AlignmentResearch/IMDB",
-        "split_file": "src/data/imdb_splits.json",
-        "train_split": "ft_train",
-        "ckpt": "out/pythia410m/imdb/best_IMDB.pt",
-        "circuit_base": "analysis/imdb_train_circuit"
-    }
+    # "IMDB": {
+    #     "path": "AlignmentResearch/IMDB",
+    #     "split_file": "src/data/imdb_splits.json",
+    #     "train_split": "ft_train",
+    #     "ckpt": "outputs_gpt2_baseline/imdb/best_IMDB.pt",
+    #     #"circuit_base": "analysis/imdb_train_circuit"
+    # }
 }
 
 # 3. 定义 Layer Grid (攻击层 vs ReFT 层)
 # (Layer Idx, Attack Layer)
 LAYER_PAIRS = [
-    (1, 1),
-    (6, 1), (6, 6),
-    (11, 1), (11, 6), (11, 11),
-    (16, 1), (16, 6), (16, 11), (16, 16),
-    (21, 1), (21, 6), (21, 11), (21, 16), (21, 21)
+    #(1, 1),
+    (5, 4), #(6, 6),
+    #(11, 1), (11, 6), (11, 11),
+    #(16, 1), (16, 6), (16, 11), (16, 16),
+    #(21, 1), (21, 6), (21, 11), (21, 16), (21, 21)
 ]
 TASKS = []
 
@@ -72,23 +72,23 @@ def run_task(args):
     
     # 构造唯一 Tag (目录名)
     # 格式: Helpful_L16_A6_gcg1_top20
-    tag = f"{d_name}_L{reft_l}_A{att_l}_gcg1_top20"
-    out_dir = f"output_20circuits/{d_name}/{tag}"
+    tag = f"l1_{d_name}_gpt2_L{reft_l}_A{att_l}_pgd10_eps224_ep10_rank64_stepsize1_lambda10"
+    out_dir = f"outputs_gpt2_full_l1/{d_name}/{tag}"
     
     # 如果跑过了，跳过
-    if os.path.exists(os.path.join(out_dir, "final_intervention")):
-        print(f"[Skip] {tag} already exists.")
-        return
+    # if os.path.exists(os.path.join(out_dir, "final_intervention")):
+    #     print(f"[Skip] {tag} already exists.")
+    #     return
 
     # 构造 Circuit Path
     # 你的需求：analysis/helpful_train_circuit/circuit_20.json
     # 所以这里固定拼接 "circuit_20.json"
-    circuit_file = os.path.join(d_cfg["circuit_base"], "circuit_20.json")
+    # circuit_file = os.path.join(d_cfg["circuit_base"], "circuit_20.json")
     
-    # 检查 circuit 文件是否存在，防止跑空
-    if not os.path.exists(circuit_file):
-        print(f"[Error] Circuit file not found: {circuit_file}")
-        return
+    # # 检查 circuit 文件是否存在，防止跑空
+    # if not os.path.exists(circuit_file):
+    #     print(f"[Error] Circuit file not found: {circuit_file}")
+    #     return
 
     # 构造命令 (使用 OmegaConf dotlist 语法: key=value)
     # 必须匹配 train_reft_adv.py 里的 cfg 结构
@@ -105,16 +105,25 @@ def run_task(args):
         # f"data.label_field=clf_label",
         
         # 模型覆盖
+        f"model.model_name=gpt2", # 模型名称覆盖为 gpt2
         f"model.load_baseline_ckpt={d_cfg['ckpt']}",
         f"model.layer_idx={reft_l}",
+        f"model.rank_r=64",
+        f"model.position=l1",
         f"train.attack_layer={att_l}",
+        f"train.lambda_adv=10.0",
+        f"train.epochs=10",
         
         # 训练参数覆盖 (如果 yaml 里不是这些值，需要在这里强制覆盖)
-        f"train.gcg_steps=1",
-        f"train.circuit_top_k=20",
+        f"train.gcg_steps=10",
+        f"train.inner_attack=latent_pgd",
+        f"train.eps_r=2.24",
+        f"wandb_name={tag}",
+        f"train.gcg_topk=64",
+        #f"train.circuit_top_k=20",
         
         # Circuit 相关覆盖
-        f"train.circuit_path={circuit_file}",
+        #f"train.circuit_path={circuit_file}",
         
         # 输出目录覆盖
         f"out.dir={out_dir}"
@@ -124,8 +133,8 @@ def run_task(args):
     print(f"[Start GPU{gpu_id}] {tag}")
     
     # 这里的 log 是 launcher 的调度日志
-    os.makedirs("logs_launcher", exist_ok=True)
-    log_file = f"logs_launcher/{tag}.log"
+    os.makedirs("logs_launcher_l1", exist_ok=True)
+    log_file = f"logs_launcher_l1/{tag}.log"
     
     with open(log_file, "w") as f:
         subprocess.run(cmd_str, shell=True, stdout=f, stderr=f)
