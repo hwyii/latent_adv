@@ -53,6 +53,8 @@ def main():
     cli_conf = OmegaConf.from_cli()
     
     # 获取基础配置文件路径 (默认 configs/train_reft.yaml)
+    os.environ["WANDB_PROJECT"] = cli_conf.get("wandb_project", "latent_adv_reft")
+    os.environ["WANDB_LOG_MODEL"] = "false" 
     config_path = cli_conf.get("config", "configs/train_reft.yaml")
     base_conf = OmegaConf.load(config_path)
     
@@ -92,6 +94,12 @@ def main():
     with open(cfg.data.split_file, "r") as f:
         splits = json.load(f)
     train_indices = splits.get(cfg.data.train_split)
+    # 减少训练样本
+    import random
+    if len(train_indices) > 5000:
+        random.seed(cfg.train.seed) # 保证实验可复现
+        train_indices = random.sample(train_indices, 5000)
+        logger.info(f"Downsampled training set to 5,000 samples.")
     
     if train_indices is None:
         logger.warning(f"Split '{cfg.data.train_split}' not found. Using full dataset.")
@@ -121,7 +129,7 @@ def main():
         load_best_model_at_end=True,
         metric_for_best_model="eval_accuracy", 
         save_total_limit=cfg.train.get("save_total_limit", 2),
-        report_to="none", # 在这里关掉 wandb，如果需要可以在 launcher 里控制环境变量
+        report_to="wandb", # 在这里关掉 wandb，如果需要可以在 launcher 里控制环境变量
         remove_unused_columns=False,
     )
 
