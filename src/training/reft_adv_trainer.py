@@ -2,6 +2,7 @@
 from typing import Optional, Dict, Any
 from sympy import N, n_order
 import torch
+import copy, os, json
 import pyvene as pv
 from torch.nn import CrossEntropyLoss, MSELoss, BCEWithLogitsLoss
 from pyreft.reft_trainer import ReftTrainerForSequenceClassification, make_dataloader
@@ -11,16 +12,53 @@ from src.attack.inner_attack import AttackConfig
 from src.models.adv_intervention import AdversarialIntervention
 from src.circuit.circuit_mask import load_circuit_mask, mask_summary
 from src.models.circuitable_attention import make_circuitable_neox, set_circuit_on_model
+from src.circuit.fast_circuit import FastCircuitSlicer, extract_active_heads
+from src.utils.tools import _cosine, _proj_scalar, _safe_norm, load_r_attack_any
+from src.circuit.surrogate_builder import build_surrogate_model
+
+def get_inactive_heads_dict(circuit_mask_tensor):
+    """把你的 0/1 Mask 转换成 Surrogate Builder 需要的格式：要删掉的 Heads"""
+    inactive_dict = {}
+    num_layers = circuit_mask_tensor.shape[0]
+    for l in range(num_layers):
+        # 找到值为 0 的索引（即不活跃的、需要被剪枝的 heads）
+        inactive = torch.where(circuit_mask_tensor[l] == 0)[0].tolist()
+        if inactive:
+            inactive_dict[l] = inactive
+    return inactive_dict
 
 logger = logging.get_logger(__name__)
 
 class ReftAdversarialTrainerForSequenceClassification(ReftTrainerForSequenceClassification):
-    def __init__(self, *args, attack_config: Optional[AttackConfig] = None, **kwargs):
+    def __init__(self, 
+                 *args, 
+                 attack_config: Optional[AttackConfig] = None, 
+                 r_attack_path: Optional[str] = None,
+                 r_attack_layer: Optional[int] = None,
+                 r_attack_key: Optional[str] = None,
+                 r_attack_scale: float = 1.0,
+                 **kwargs):
         super().__init__(*args, **kwargs)
         self.attack_config = attack_config
+        
         self._setup_adversarial()
         self._setup_circuit()
 
+        # r_attack 相关
+        self.r_attack = None
+        self.r_attack_scale = float(r_attack_scale)
+        self._setup_r_attack(r_attack_path, r_attack_layer, r_attack_key)
+        
+    def _setup_r_attack(self, path, layer, key):
+        # 加上对字符串 "None" 或 "null" 的拦截
+        if path is not None and str(path).lower() not in ["none", "null"]:
+            from src.utils.tools import load_r_attack_any
+            self.r_attack = load_r_attack_any(path, layer=layer, key=key)
+            logger.info(f"[R-Attack] Loaded vector shape={tuple(self.r_attack.shape)} from {path}")
+        else:
+            self.r_attack = None
+            logger.info("[R-Attack] No r_attack_path provided. Vector injection disabled.")
+    
     def _setup_adversarial(self):
         """初始化对抗攻击模块"""
         self.adv_intervention = None
@@ -35,65 +73,78 @@ class ReftAdversarialTrainerForSequenceClassification(ReftTrainerForSequenceClas
             logger.info(f"[AdvTrainer] Attack Enabled: {self.attack_config.inner_attack}")
         else:
             logger.info("[AdvTrainer] Attack Disabled.")
-
+    
     def _setup_circuit(self):
-        """初始化 Circuit Gate"""
+        """初始化 Surrogate 代理模型机制"""
         self.circuit_spec = None
-        self._base_model = None
-        self._circuit_mask_cpu = None
+        self.surrogate_intervenable = None
+        self.surrogate_adv = None
 
         cfg = self.attack_config
         if cfg and getattr(cfg, "use_circuit_gate", False):
-            if not getattr(cfg, "circuit_path", None):
-                raise ValueError("use_circuit_gate=True but circuit_path is None")
-
-            base = self.model.model
-            self._base_model = base
+            base = self.model.model  # 这是 HF 的底层 GPT-2
+            config = base.config
             
-            # 支持多种结构
-            
-            if not hasattr(base, "gpt_neox"):
-                raise NotImplementedError("Currently only Pythia/GPT-NeoX is supported for circuit gate.")
-            config = base.gpt_neox.config
-            num_layers = len(base.gpt_neox.layers)
-            num_heads = config.num_attention_heads
-            
-            # 加载 Mask (格式：configs/circuits/pythia-410m/Helpful_Patching_top20.json)
+            # 1. 加载你的 Circuit Mask
             spec = load_circuit_mask(
                 json_path=cfg.circuit_path,
-                num_layers=num_layers,
-                num_heads=num_heads,
+                num_layers=config.n_layer,
+                num_heads=config.n_head,
                 device=None
             )
-            total, per_layer = mask_summary(spec.mask)
-            logger.info(f"[Circuit] Loaded {cfg.circuit_path} | Heads: {total}")
-
             self.circuit_spec = spec
-            self._circuit_mask_cpu = spec.mask.detach().cpu()
+            inactive_heads = get_inactive_heads_dict(spec.mask)
+            
+            logger.info(f"[Surrogate] use_circuit_gate = {getattr(cfg, 'use_circuit_gate', False)}")
+            logger.info(f"[Surrogate] circuit_path = {getattr(cfg, 'circuit_path', None)}")
+            logger.info(f"[Surrogate] mlp_mask_path = {getattr(cfg, 'mlp_mask_path', None)}")
+            logger.info(f"[Surrogate] mlp_keep_ratio = {getattr(cfg, 'mlp_keep_ratio', None)}")
 
-            # 安装 Hook, 默认关闭状态
-            make_circuitable_neox(base)
+            mlp_mask_dict = {}
+            if getattr(cfg, "mlp_mask_path", None) and str(cfg.mlp_mask_path).lower() not in ["none", "null"]:
+                if os.path.exists(cfg.mlp_mask_path):
+                    with open(cfg.mlp_mask_path, "r") as f:
+                        mlp_mask_dict = json.load(f)
+                    logger.info(
+                        f"[Surrogate] Loaded MLP mask: layers={len(mlp_mask_dict)}, "
+                        f"sample_keys={list(mlp_mask_dict.keys())[:5]}"
+                    )
+                    for k in list(mlp_mask_dict.keys())[:3]:
+                        logger.info(
+                            f"[Surrogate] sample layer {k}: prune_count={len(mlp_mask_dict[k])}, "
+                            f"first10={mlp_mask_dict[k][:10]}"
+                        )
+                else:
+                    logger.warning(f"[Surrogate] MLP Mask file not found: {cfg.mlp_mask_path}")
 
+            # 2. 物理创造 Surrogate (假设 cfg.mlp_keep_ratio 在 yaml 里配了，默认 1.0)
+            mlp_ratio = getattr(cfg, "mlp_keep_ratio", 1.0)
+            logger.info(f"[Surrogate] Building... MLP Keep Ratio: {mlp_ratio}")
+            #surrogate_base = build_surrogate_model(base, inactive_heads, mlp_keep_ratio=mlp_ratio)
+
+            from src.circuit.surrogate_builder import build_surrogate_model
+            surrogate_base = build_surrogate_model(
+                base, 
+                inactive_heads, 
+                mlp_keep_ratio=mlp_ratio,
+                mlp_mask_dict=mlp_mask_dict  # <--- 核心！
+            )
+            
+            # 3. 给 Surrogate 挂上 Pyvene (完美复刻 Base 的干预配置)
+            # 因为 Surrogate 的架构名字和 Base 一模一样，所以配置可以直接深拷贝！
+            surrogate_config = copy.deepcopy(self.model.config)
+            self.surrogate_intervenable = pv.IntervenableModel(surrogate_config, surrogate_base)
+
+            # 4. 找到 Surrogate 身上的 Attack 矛 (delta)，方便我们等会提取
+            for k, v in self.surrogate_intervenable.interventions.items():
+                if isinstance(v, AdversarialIntervention):
+                    self.surrogate_adv = v
+                    break
+                    
+            if self.surrogate_adv is None:
+                raise RuntimeError("Failed to find AdversarialIntervention on Surrogate Model!")
+    
     def compute_loss(self, intervenable, inputs, return_outputs=False):
-        
-        # ###################### [debug]
-        # lens = inputs["attention_mask"].sum(dim=1)  # [B]
-        # loc = inputs["intervention_locations"]      # 形状一般 [B, n_rep, n_loc] 或 [B, 1, last_n]
-        # B, S = inputs["input_ids"].shape
-
-        # # 取第一组 rep 的位置（通常就是 0）
-        # loc0 = loc[:, 0, :]  # [B, n_loc]
-
-        # bad = (loc0 >= lens.unsqueeze(1)).any().item()
-        # print(f"[LOC] B={B} S={S} lens(min/mean/max)={int(lens.min())}/{float(lens.float().mean()):.1f}/{int(lens.max())}")
-        # print(f"[LOC] loc shape={tuple(loc.shape)} loc0 min/max={int(loc0.min())}/{int(loc0.max())}  any_loc_outside_len={bad}")
-
-        # # 看前 3 条样本：最后一个有效 token index = len-1
-        # for i in range(min(3, B)):
-        #     last = int(lens[i].item()) - 1
-        #     print(f"[LOC] i={i} len={int(lens[i])} last_idx={last} loc0_tail={loc0[i,-10:].tolist()}")
-        # ########################
-        
         # 1. 数据预处理
         if inputs["labels"].dim() == 2: inputs["labels"] = inputs["labels"].squeeze(1)
         
@@ -114,42 +165,83 @@ class ReftAdversarialTrainerForSequenceClassification(ReftTrainerForSequenceClas
         
         total_loss = clean_loss
         adv_loss = None
-        
-        #################### [debug]
-        with torch.no_grad():
-            cl = clean_loss.item()
-            print(f"[LOSS] clean_loss={cl:.4f} logits_mean={cf_outputs.logits.float().mean().item():.4f} logits_std={cf_outputs.logits.float().std().item():.4f}")
-        #################
+        diag_adv = {}
 
         # 3. Inner Attack Loop
         cfg = self.attack_config
+        
         if cfg and cfg.inner_attack != "none":
-            self._run_inner_attack(intervenable, inputs, unit_locations, inputs["labels"])
-
+            # 分支 A：R-Attack 向量注入 (直接在 Base 上操作)
+            if cfg.inner_attack in ("r_attack", "r_attack_ablate"):
+                final_delta, diag_adv = self._set_delta_from_r_attack_vector(
+                    intervenable, 
+                    inputs, 
+                    unit_locations, 
+                    inputs["labels"], 
+                    eps=float(cfg.eps), 
+                    mode=cfg.inner_attack
+                )
+                self.adv_intervention.delta = final_delta
+                
+            # 分支 B：梯度优化 (PGD/GCG 等)
+            elif cfg.inner_attack in ("latent_pgd", "latent_gcg_coord", "random_noise"):
+                
+                if getattr(cfg, "use_circuit_gate", False) and self.surrogate_intervenable is not None:
+                    # >>> Surrogate 模式 <<<
+                    
+                    # 1. 同步防御参数 (Shield Sync)
+                    with torch.no_grad():
+                        for (k_b, v_b), (k_s, v_s) in zip(
+                            self.model.interventions.items(), 
+                            self.surrogate_intervenable.interventions.items()
+                        ):
+                            if not isinstance(v_b, AdversarialIntervention):
+                                for p_b, p_s in zip(v_b.parameters(), v_s.parameters()):
+                                    p_s.copy_(p_b)
+                    
+                    # 2. 内环攻击 (在 Surrogate 上寻找 delta)
+                    self._run_inner_attack(
+                        target_intervenable=self.surrogate_intervenable, 
+                        target_adv=self.surrogate_adv,
+                        inputs=inputs, 
+                        unit_locations=unit_locations, 
+                        labels=inputs["labels"]
+                    )
+                    
+                    # 3. 交接武器 (Weapon Transfer)
+                    self.adv_intervention.delta = self.surrogate_adv.delta.detach().clone()
+                    
+                else:
+                    # >>> 全量 Baseline 模式 <<<
+                    self._run_inner_attack(
+                        target_intervenable=intervenable, 
+                        target_adv=self.adv_intervention,
+                        inputs=inputs, 
+                        unit_locations=unit_locations, 
+                        labels=inputs["labels"]
+                    )
+            else:
+                raise ValueError(f"Unsupported inner_attack: {cfg.inner_attack}")
+            
             # 4. Final Adversarial Forward (Update ReFT params)
             if self.adv_intervention.delta is not None:
                 delta_tensor_for_log = self.adv_intervention.delta.detach()
                 K = int(delta_tensor_for_log.shape[1])
 
-                self.adv_intervention.delta = delta_tensor_for_log  # 原来 detach 的逻辑
+                self.adv_intervention.delta = delta_tensor_for_log  # 固定 delta
                 intervenable.zero_grad()
-            
                 
                 _, cf_final = intervenable(
                     {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]},
                     unit_locations=unit_locations,
-                    labels=inputs["labels"]
+                    labels=inputs["labels"],
+                    subspaces=inputs["subspaces"].permute(1, 0, 2).tolist() if "subspaces" in inputs else None
                 )
                 adv_loss = self._calculate_standard_loss(cf_final.logits, inputs["labels"])
                 
                 self.adv_intervention.reset_delta()
                 total_loss = clean_loss + float(cfg.lambda_adv) * adv_loss
-                
-                #################### [debug]
-                with torch.no_grad():
-                    al = adv_loss.item()
-                    print(f"[LOSS] adv_loss={al:.4f} (ratio={al/(cl+1e-8):.3f}) logits_mean={cf_final.logits.float().mean().item():.4f} logits_std={cf_final.logits.float().std().item():.4f}")
-                ##################                
+                          
         # 优化后的 Logging 逻辑
         if self.state.global_step % self.args.logging_steps == 0 and self.args.process_index == 0:
 
@@ -186,18 +278,21 @@ class ReftAdversarialTrainerForSequenceClassification(ReftTrainerForSequenceClas
                     "metrics/delta_per_token_L2": delta_l2_mean,
                     "metrics/delta_Linf_max": delta_linf,
                 })
+                
+                # ---> 【新增：把 R-Attack 的特殊指标加到日志里】 <---
+                for k, v in diag_adv.items():
+                    log_dict[f"metrics/{k}"] = float(v)
             
             self.log(log_dict)
 
         return (total_loss, cf_outputs) if return_outputs else total_loss
 
-    def _run_inner_attack(self, intervenable, inputs, unit_locations, labels):
-        """执行内部攻击循环 (GCG/PGD)"""
+    def _run_inner_attack(self, target_intervenable, target_adv, inputs, unit_locations, labels):
+        """纯净版的 PGD 内环：不包含任何软切片/断梯度逻辑"""
         cfg = self.attack_config
-        
-        # A. Random Noise (No Loop)
+
         if cfg.inner_attack == "random_noise":
-            current_delta = self.adv_intervention.delta
+            current_delta = target_adv.delta
             if current_delta is not None:
                 eps = float(cfg.eps)
                 noise = torch.rand_like(current_delta) * 2 * eps - eps
@@ -205,89 +300,143 @@ class ReftAdversarialTrainerForSequenceClassification(ReftTrainerForSequenceClas
                     current_delta.add_(noise).clamp_(-eps, eps)
             return
 
-        # B. Gradient-based Attack (Loop)
         steps = int(cfg.steps)
         eps = float(cfg.eps)
-        step_size = 1 * (eps / max(1, steps)) 
+        step_size = 1 * (eps / max(1, steps))
+        target_adv.reset_delta()
+
+        for t in range(steps):
+            target_intervenable.zero_grad()
+
+            subspaces = inputs["subspaces"].permute(1, 0, 2).tolist() if "subspaces" in inputs else None
+
+            _, cf_adv = target_intervenable(
+                {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]},
+                unit_locations=unit_locations,
+                labels=labels,
+                subspaces=subspaces,
+            )
+            
+            loss = self._calculate_standard_loss(cf_adv.logits, labels)
+            loss.backward()
+
+            if t == 0:
+                initial_loss = loss.item()
+            self._update_delta_grad(cfg, step_size, eps, target_adv=target_adv)
+
+            with torch.no_grad():
+                d = target_adv.delta
+                K = d.shape[1]
+                H = d.shape[2]
+                l2 = d.view(d.size(0), -1).norm(p=2, dim=1).mean().item()
+                l2_per_tok = l2 / ((K * H) ** 0.5)
+                absmax = d.abs().max().item()
+
+            if t == 0 or t == steps - 1 or t % 2 == 0:
+                self.log({
+                    "inner/step": t,
+                    "inner/loss": loss.item(),
+                    "inner/delta_absmax": absmax,
+                    "inner/delta_l2_mean": l2,
+                    "inner/delta_l2_per_tok": l2_per_tok,
+                    "inner/K": K,
+                    "inner/eps": float(eps),
+                    "inner/step_size": float(step_size),
+                    "inner/global_step": self.state.global_step
+                })
+
+            if t == steps - 1:
+                final_loss = loss.item()
+                self.log({
+                    "train/attack_absolute_gain": final_loss - initial_loss,
+                    "train/attack_relative_gain": final_loss / (initial_loss + 1e-8),
+                    "train/attack_gain_per_tok": (final_loss - initial_loss) / max(K, 1),
+                })
+       
+       
+    def _set_delta_from_r_attack_vector(self, intervenable, inputs, unit_locations, labels, eps, mode):
+        """
+        专门用于 R-Attack 模式：进行一次空前向传播以初始化 delta，
+        然后用归一化且缩放后的 r_attack 向量覆盖它。
+        """
+        if self.adv_intervention is None:
+            raise RuntimeError("No adv_intervention found but requested r_attack mode")
+        if getattr(self, "r_attack", None) is None:
+            raise RuntimeError("r_attack mode requested but self.r_attack is None. Provide r_attack_path.")
+
+        # 1. Warmup forward: 确保 adv_intervention.delta 被 lazily 初始化
         self.adv_intervention.reset_delta()
-
-        # Gate Control
-        gate_mode = getattr(cfg, "gate_mode", "inner_only")
-        do_stopgrad = (self.circuit_spec is not None and gate_mode in ("inner_only", "inner+final"))
+        intervenable.zero_grad()
         
-        if do_stopgrad:
-            set_circuit_on_model(self._base_model, self._circuit_mask_cpu, enabled=True)
+        # 提取 subspaces (如果输入中存在)
+        subspaces = inputs["subspaces"].permute(1, 0, 2).tolist() if "subspaces" in inputs else None
+        
+        # 跑一次前向传播，主要为了过一遍 Intervention 的 forward 逻辑
+        _, _ = intervenable(
+            {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]},
+            unit_locations=unit_locations,
+            labels=labels,
+            subspaces=subspaces
+        )
 
-        try:
-            for t in range(steps):
-                intervenable.zero_grad()
-                
-                # Forward
-                _, cf_adv = intervenable(
-                    {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]},
-                    unit_locations=unit_locations,
-                    labels=labels,
+        delta_tensor = self.adv_intervention.delta
+        if delta_tensor is None:
+            raise RuntimeError("adv_intervention.delta is None after warmup forward. "
+                               "Your AdversarialIntervention may not initialize delta in forward().")
+
+        # 2. 计算并覆盖 delta
+        with torch.no_grad():
+            r = self.r_attack.to(delta_tensor.device).to(delta_tensor.dtype).view(-1)  # [H]
+            r_norm = torch.norm(r) + 1e-12
+            r_unit = r / r_norm
+
+            # 判断是添加方向还是消融方向
+            sign = +1.0 if mode == "r_attack" else -1.0
+            vec = sign * (eps * getattr(self, "r_attack_scale", 1.0)) * r_unit  # [H]
+
+            # 广播到 delta_tensor 的形状 (例如针对不同 batch 或 token 数，扩展 [B, K, H])
+            view_shape = [1] * delta_tensor.dim()
+            view_shape[-1] = -1
+            vec = vec.view(*view_shape).expand_as(delta_tensor)
+
+            delta_tensor.copy_(vec)
+            self.adv_intervention.delta = delta_tensor.detach()
+
+        # 3. 计算用于 Logging 的诊断指标 (Diagnostics)
+        diag = {}
+        diag["delta_norm"] = _safe_norm(delta_tensor)
+
+        # cos(delta, r_attack) — 使用 per-sample mean delta vector
+        delta_mean = delta_tensor.detach().float().mean(dim=tuple(range(delta_tensor.dim() - 1)))  # [H]
+        diag["cos_delta_r_attack"] = _cosine(delta_mean, self.r_attack.to(delta_mean.device))
+
+        # proj(h, r_attack) — 尽力获取 last_base
+        proj = float("nan")
+        base = getattr(self.adv_intervention, "last_base", None)
+        if isinstance(base, torch.Tensor):
+            # base 可能是 [B,H] 或 [B,1,H] 或 [B,T,H]
+            base_mean = base.detach().float().mean(dim=tuple(range(base.dim() - 1)))  # [H]
+            proj = _proj_scalar(base_mean, self.r_attack.to(base_mean.device))
+        else:
+            if not getattr(self, "_warned_missing_base", False):
+                logger.warning(
+                    "[AdvTrainer] proj(h, r_attack) requires AdversarialIntervention to expose last_base.\n"
+                    "Add inside AdversarialIntervention.forward(base, ...): self.last_base = base.detach()"
                 )
-                loss = self._calculate_standard_loss(cf_adv.logits, labels)
+                self._warned_missing_base = True
+        diag["proj_h_r_attack"] = float(proj)
 
-                # Backward
-                loss.backward()
-                    
-                if t == 0: 
-                    initial_loss = loss.item()
-                self._update_delta_grad(cfg, step_size, eps)
-                # === 记录 delta 尺度：建议每步都记录轻量版 ===
-                with torch.no_grad():
-                    d = self.adv_intervention.delta
-                    K = d.shape[1]; H = d.shape[2]
-                    l2 = d.view(d.size(0), -1).norm(p=2, dim=1).mean().item()
-                    l2_per_tok = l2 / ((K * H) ** 0.5)
-                    absmax = d.abs().max().item()
-
-                # 每步都 log（如果担心 wandb 卡，就每隔几步 log）
-                if t == 0 or t == steps - 1 or t % 2 == 0:
-                    self.log({
-                        "inner/step": t,
-                        "inner/loss": loss.item(),
-                        "inner/delta_absmax": absmax,
-                        "inner/delta_l2_mean": l2,
-                        "inner/delta_l2_per_tok": l2_per_tok,
-                        "inner/K": K,
-                        "inner/eps": float(eps),
-                        "inner/step_size": float(step_size),
-                        "inner/global_step": self.state.global_step
-                    })
-
-                # 最后一轮：记录 gain（用 initial_loss）
-                if t == steps - 1:
-                    final_loss = loss.item()
-                    self.log({
-                        "train/attack_absolute_gain": final_loss - initial_loss,
-                        "train/attack_relative_gain": final_loss / (initial_loss + 1e-8),
-                        "train/attack_gain_per_tok": (final_loss - initial_loss) / max(K, 1),
-                    })
-                
-        finally:
-            # 无论攻击过程中发生什么，都确保最后关闭电路门，恢复正常梯度流
-            if do_stopgrad:
-                set_circuit_on_model(self._base_model, None, enabled=False)
-
-    def _update_delta_grad(self, cfg, step_size, eps):
-        delta = self.adv_intervention.delta
+        return delta_tensor.detach(), diag   
+        
+    def _update_delta_grad(self, cfg, step_size, eps, target_adv=None):
+        adv_module = target_adv if target_adv is not None else self.adv_intervention
+        delta = adv_module.delta
         if delta is None or delta.grad is None: 
             print("[DELTA] grad is None")
             return
 
         with torch.no_grad():
             g = delta.grad
-            
-            ################## [debug]
-            g_abs = g.abs()
-            print(f"[DELTA] shape={tuple(delta.shape)} "
-                f"g_abs_mean={g_abs.mean().item():.3e} g_abs_max={g_abs.max().item():.3e} "
-                f"g_nonzero={(g_abs>0).float().mean().item():.4f} "
-                f"delta_absmax_before={delta.abs().max().item():.4f}")
-            ###################
             
             if cfg.inner_attack == "latent_pgd":
                 delta.add_(step_size * g.sign())
@@ -301,9 +450,6 @@ class ReftAdversarialTrainerForSequenceClassification(ReftTrainerForSequenceClas
                 delta_flat[topk_idx] += step_size * g_flat[topk_idx].sign()
             
             delta.clamp_(-eps, eps)
-            #################### [debug]
-            print(f"[DELTA] delta_absmax_after={delta.abs().max().item():.4f} eps={eps:.4f} step={step_size:.4f}")
-            ###################
             delta.grad.zero_()
             delta.requires_grad_(True)
 
