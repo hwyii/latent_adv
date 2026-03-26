@@ -293,8 +293,7 @@ def main():
         for ds in active_datasets:
             tag = f"{model['short']}/{ds['tag']}"
             out_dir = os.path.join("outputs", "stage0", model["short"], ds["tag"])
-            overrides = {}
-            deep_update(overrides, model["overrides"])
+            overrides = copy.deepcopy(model["overrides"])  # deep copy: avoid mutating MODELS entries
             deep_update(overrides, ds["overrides"])
             overrides.setdefault("model", {})["name"] = model["name"]
             jobs.append({

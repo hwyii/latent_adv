@@ -1,3 +1,4 @@
+# src/models/reft_latent.py
 # 统一的模型构建和加载工具
 
 import torch
@@ -20,6 +21,28 @@ def build_base_classifier(model_name: str, num_labels: int = 2) -> Tuple[AutoMod
         model.config.eos_token_id = tokenizer.eos_token_id
     return model, tokenizer
 
+def _get_layer_str(model_name: str, layer_idx: int) -> str:
+    """
+    根据模型类型返回 Pyvene 需要的 component 字符串
+    """
+    name = model_name.lower()
+    # === 适配 GPT-2 ===
+    if "gpt2" in name:
+        # GPT-2 的层列表在 transformer.h 中
+        # targeting the block output
+        return f"transformer.h[{layer_idx}].output"
+    
+    # === 适配 Pythia / GPT-NeoX ===
+    elif "pythia" in name or "neox" in name:
+        # Pythia 的层列表在 gpt_neox.layers 中
+        return f"gpt_neox.layers[{layer_idx}].output"
+    
+    # === 适配 Llama / Mistral / Qwen2 / Gemma (均使用 model.layers) ===
+    elif any(k in name for k in ("llama", "mistral", "qwen2", "qwen3", "gemma")):
+        return f"model.layers[{layer_idx}].output"
+
+    else:
+        raise ValueError(f"Unknown model architecture for {model_name}, please add config manually.")
 
 def build_reft_model(
     model_name: str,
@@ -46,12 +69,15 @@ def build_reft_model(
     hidden_size = base_model.config.hidden_size
     reft_comp_idx = reft_layer - 1
     
+    reft_comp_str = _get_layer_str(model_name, reft_comp_idx)
+    print(f"[build_reft_model] LoReFT 将插入在层 {reft_layer} 的组件 {reft_comp_str} 上")
+    
     # ReFT config: 指定插入层和 LoReFT 
     reft_config = ReftConfig(
         representations=[
             {
                 "layer": reft_layer,
-                "component": f"gpt_neox.layers[{reft_comp_idx}].output",
+                "component": reft_comp_str,
                 "low_rank_dimension": rank_r,
                 "intervention": LoreftIntervention(
                     embed_dim=hidden_size,
@@ -65,12 +91,13 @@ def build_reft_model(
     )
     if attack_layer is not None:
         attack_comp_idx = attack_layer - 1
+        attack_comp_str = _get_layer_str(model_name, attack_comp_idx)
         reft_config = ReftConfig(
         representations=[
             # 1) LoReFT 本身
             {
                 "layer": reft_layer,
-                "component": f"gpt_neox.layers[{reft_comp_idx}].output",
+                "component": reft_comp_str,
                 "low_rank_dimension": rank_r,
                 "intervention": LoreftIntervention(
                     embed_dim=hidden_size,
@@ -83,7 +110,7 @@ def build_reft_model(
             # 2) inner attack用的 Adversarial Intervention
             {
                 "layer": attack_layer,
-                "component": f"gpt_neox.layers[{attack_comp_idx}].output",
+                "component": attack_comp_str,
                 "intervention": AdversarialIntervention(
                     embed_dim=hidden_size,
                 ),

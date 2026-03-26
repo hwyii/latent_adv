@@ -1,0 +1,28 @@
+seed: 42
+device: "cuda:5"
+wandb:
+  enable: false
+  project: "latent_adv_baseline"
+  group: "baseline"
+
+model:
+  name: "Qwen/Qwen2.5-0.5B-Instruct"
+
+data:
+  max_length: 512
+  train_bsz: 8
+  eval_bsz: 8
+  split_file: "src/data/enron_splits.json"
+  dataset: "AlignmentResearch/EnronSpam"
+
+train:
+  epochs: 3
+  lr: 0.00002
+  weight_decay: 0.01
+  fp16: false   # model loads in bfloat16; GradScaler (fp16-only) is not needed
+  log_every: 50
+  grad_accum_steps: 1  # increase for large models to simulate larger effective batch
+  max_grad_norm: 1.0
+
+out:
+  dir: "outputs/default_run"

@@ -2,19 +2,20 @@
 device: "cuda" 
 
 model:
-  model_name: "EleutherAI/pythia-410m"
-  rank_r: 4
+  model_name: "gpt2" #"EleutherAI/pythia-410m"
+  rank_r: 64
   max_length: 512
   position: "l1"
+  layer_idx: 5
   
 data:
   input_field: "content"
   label_field: "clf_label"
 
 train:
-  train_bsz: 8
+  train_bsz: 32
   eval_bsz: 16
-  lr_wb: 0.0005
+  lr_wb: 0.0001
   lr_all: 0.0001
   weight_decay: 0.01
   epochs: 3
@@ -23,12 +24,15 @@ train:
 
   lambda_adv: 0.5
   attack_layer: 13
-  inner_attack: "latent_gcg_coord" # latent_pgd | latent_gcg_coord
+  inner_attack: "latent_pgd" # latent_pgd | latent_gcg_coord ｜ r_attack
   eps_r: 0.05 # PGD和GCG共享此参数
   gcg_steps: 1 # PGD和GCG共享此参数
   gcg_topk: 32
+
+  r_attack_path: None # "out/pythia410m/helpful/suffix_baseline_eval_last_token_gcgcoord_10tokens_20rounds.json"
+  r_attack_scale: 1.0
   
-  logging_steps: 50
+  logging_steps: 5
   evaluation_strategy: "epoch"
   save_strategy: "epoch"
   save_total_limit: 1
@@ -38,15 +42,17 @@ train:
   early_stopping_threshold: 0.0
 
   # circuit gate相关配置
-  use_circuit_gate: true # 默认开启，可在param_grid中关闭
+  use_circuit_gate: false
   gate_mode: inner_only
   circuit_top_k: 20
+  circuit_path: "configs/circuits/gpt2/Helpful_Patching_top20.json"
+  mlp_keep_ratio: 0.5
 
   # wandb配置
-  use_wandb: false
-  wandb_project: "latent_adv_reft_new"
+  use_wandb: true
+  wandb_project: "reft_latent_adv_gp2_rank_search"
   wandb_entity: "heweiyi"
-  wandb_run_name: "reft_latent_adv_pythia410m_harmless"
+  wandb_run_name: "debug_default"
 
 out:
   dir: "outputs/debug_default" # 留一个默认值防止报错，但实际会被覆盖
