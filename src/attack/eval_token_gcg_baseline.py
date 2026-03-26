@@ -19,12 +19,11 @@ logger = hf_logging.get_logger(__name__)
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="EleutherAI/pythia-410m")
-    parser.add_argument("--baseline_ckpt", type=str, required=True,
-                        help="如 out/pythia410m/harmless/best_Harmless.pt")
+    parser.add_argument("--model_name", type=str, default="gpt2")
+    parser.add_argument("--baseline_ckpt", type=str, required=True)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--dataset", type=str, default="AlignmentResearch/Harmless")
-    parser.add_argument("--split", type=str, default="validation")
+    parser.add_argument("--split", type=str, required=True)
     parser.add_argument("--input_field", type=str, default="content")
     parser.add_argument("--label_field", type=str, default="clf_label")
     parser.add_argument("--position", type=str, default="l1")
@@ -32,7 +31,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_json", type=str, default=None)
 
-    # GCG 超参（保持和 ReFT eval 一致）
+    # GCG 超参
     parser.add_argument("--attack_start", type=int, default=0)
     parser.add_argument("--n_attack_tokens", type=int, default=5)
     parser.add_argument("--beam_k", type=int, default=512)
@@ -45,24 +44,25 @@ def main():
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    # 1) 加载 baseline 模型
+    # 1) 加载模型与 Tokenizer
     base_model = AutoModelForSequenceClassification.from_pretrained(
-        args.model_name,
-        num_labels=2,
+        args.model_name, num_labels=2
     )
     state = torch.load(args.baseline_ckpt, map_location="cpu")
     base_model.load_state_dict(state, strict=False)
     base_model.to(device).eval()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    # GPT-2 特殊处理
+    if "gpt2" in args.model_name:
+        tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.model_max_length = 512  # 和训练一致
+    tokenizer.model_max_length = 512
 
-    # 2) attack split
+    # 2) 加载攻击数据集
     with open(args.split, "r") as f:
         splits = json.load(f)
-
     attack_indices = splits["attack"]
 
     attack_dataset, _ = build_reft_classification_datasets(
@@ -77,25 +77,28 @@ def main():
         num_interventions=1,
     )
 
-    n_total = len(attack_dataset)
-    n_eval = min(args.max_eval_samples, n_total) if args.max_eval_samples > 0 else n_total
-    print(f"[Token GCG Attack BASELINE] 总样本={n_total}, 本次评估={n_eval}")
+    n_eval = min(args.max_eval_samples, len(attack_dataset)) if args.max_eval_samples > 0 else len(attack_dataset)
+    print(f"[Token GCG Attack] 评估样本数: {n_eval}")
 
+    # 统计初始化
     stats = {
         "n_initially_correct": 0,
         "n_correct_after_attack": 0,
         "n_flipped_to_wrong_C_to_W": 0,
         "n_flipped_to_correct_W_to_C": 0,
     }
+    performance_metrics = {"total_fwd": 0, "total_bwd": 0, "total_toks": 0}
     all_results = []
 
-    for idx in tqdm(range(n_eval), desc="Token-level GCG eval (baseline)"):
+    for idx in tqdm(range(n_eval), desc="GCG eval"):
         sample = attack_dataset[idx]
         input_ids = sample["input_ids"]
         attention_mask = sample.get("attention_mask", torch.ones_like(input_ids))
         label = int(sample["labels"].item())
 
-        orig_pred, orig_loss, adv_pred, adv_loss, success, adv_ids = token_level_gcg_single_baseline(
+        # 调用函数并解包 9 个值
+        (orig_pred, orig_loss, adv_pred, adv_loss, success, adv_ids, 
+         n_fwd, n_bwd, n_toks) = token_level_gcg_single_baseline(
             model=base_model,
             tokenizer=tokenizer,
             input_ids=input_ids,
@@ -110,40 +113,38 @@ def main():
             n_candidates_per_it=args.n_candidates_per_it,
         )
 
-        if orig_pred == label:
-            stats["n_initially_correct"] += 1
-        if adv_pred == label:
-            stats["n_correct_after_attack"] += 1
-        if (orig_pred == label) and (adv_pred != label):
-            stats["n_flipped_to_wrong_C_to_W"] += 1
-        if (orig_pred != label) and (adv_pred == label):
-            stats["n_flipped_to_correct_W_to_C"] += 1
+        # 更新统计
+        performance_metrics["total_fwd"] += n_fwd
+        performance_metrics["total_bwd"] += n_bwd
+        performance_metrics["total_toks"] += n_toks
 
-        orig_text = tokenizer.decode(input_ids, skip_special_tokens=True)
-        adv_text = tokenizer.decode(adv_ids, skip_special_tokens=True)
+        if orig_pred == label: stats["n_initially_correct"] += 1
+        if adv_pred == label: stats["n_correct_after_attack"] += 1
+        if (orig_pred == label) and (adv_pred != label): stats["n_flipped_to_wrong_C_to_W"] += 1
+        if (orig_pred != label) and (adv_pred == label): stats["n_flipped_to_correct_W_to_C"] += 1
 
         all_results.append({
-            "idx": idx,
-            "label": label,
-            "orig_pred": orig_pred,
-            "adv_pred": adv_pred,
-            "orig_loss": orig_loss,
-            "adv_loss": adv_loss,
-            "success": bool(success),
-            "orig_text": orig_text,
-            "adv_text": adv_text,
+            "idx": idx, "label": label, "orig_pred": orig_pred, "adv_pred": adv_pred,
+            "orig_loss": orig_loss, "adv_loss": adv_loss, "success": bool(success),
+            "n_fwd": n_fwd, "n_bwd": n_bwd,
+            "orig_text": tokenizer.decode(input_ids, skip_special_tokens=True),
+            "adv_text": tokenizer.decode(adv_ids, skip_special_tokens=True),
         })
 
+    # 计算 Summary
     summary = calculate_and_print_stats("baseline", stats, n_samples=n_eval)
+    summary.update({
+        "avg_fwd": performance_metrics["total_fwd"] / n_eval,
+        "avg_bwd": performance_metrics["total_bwd"] / n_eval,
+        "total_fwd": performance_metrics["total_fwd"],
+        "total_bwd": performance_metrics["total_bwd"]
+    })
 
-    if args.output_json is None:
-        args.output_json = "out/pythia410m/helpful/suffix_baseline_eval_last_token_gcgcoord_100.json"
-
-    os.makedirs(os.path.dirname(args.output_json), exist_ok=True)
-    with open(args.output_json, "w") as f:
-        json.dump({"summary": summary, "per_example": all_results, "config": vars(args)},
-                  f, indent=2, ensure_ascii=False)
-    print(f"[Eval-Baseline] 结果已保存到 {args.output_json}")
+    # 保存
+    if args.output_json:
+        os.makedirs(os.path.dirname(args.output_json), exist_ok=True)
+        with open(args.output_json, "w") as f:
+            json.dump({"summary": summary, "per_example": all_results, "config": vars(args)}, f, indent=2)
 
 
 if __name__ == "__main__":
@@ -152,14 +153,16 @@ if __name__ == "__main__":
 
 '''
 CUDA_VISIBLE_DEVICES=2 python -m src.attack.eval_token_gcg_baseline \
-  --baseline_ckpt out/pythia410m/helpful/best_Helpful.pt \
-  --dataset AlignmentResearch/Helpful \
-  --split src/data/helpful_splits.json \
+  --model_name gpt2 \
+  --baseline_ckpt outputs/imdb/best_IMDB.pt \
+  --dataset AlignmentResearch/IMDB \
+  --split src/data/imdb_splits.json \
   --max_eval_samples 100 \
-  --n_attack_tokens 5 \
+  --n_attack_tokens 10 \
   --beam_k 256 \
-  --rounds 10
+  --rounds 20 \
   --attack_mode suffix \
   --n_candidates_per_it 128 \
+  --output_json outputs/imdb/suffix_baseline_eval_10tokens_20rounds.json
 '''
 

@@ -39,7 +39,16 @@ class AttackConfig:
     gcg_topk: int = None
     gcg_alpha: Optional[float] = None
     lambda_adv: float = None
-
+   
+    # ===== circuit gate =====
+    use_circuit_gate: bool = False
+    circuit_path: Optional[str] = None   # json path
+    gate_mode: str = "inner_only"        # inner_only | inner+final | final_only
+    circuit_top_k: Optional[int] = None  # 可选：覆盖 json 内 top_k
+    mlp_keep_ratio: float = 1.0
+    circuit_type: str = "surrogate"  
+    mlp_mask_path: Optional[str] = None  # 可选：MLP 掩码的 json 路径
+    
 def get_module_by_name(model: torch.nn.Module, module_name: str) -> torch.nn.Module:
     for name, module in model.named_modules():
         if name == module_name:

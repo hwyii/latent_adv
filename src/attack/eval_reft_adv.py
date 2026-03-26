@@ -44,6 +44,9 @@ def token_level_gcg_single_baseline(
          只应用全局最优的那一个修改。
     """
     model.eval()
+    n_forward = 0
+    n_backward = 0
+
     ids = input_ids.unsqueeze(0).to(device)  # (1, T)
     mask = attention_mask.unsqueeze(0).to(device)  # (1, T)
     label_t = torch.tensor([true_label], device=device)  # (1,)
@@ -51,6 +54,8 @@ def token_level_gcg_single_baseline(
     # clean forward
     with torch.no_grad():
         outputs = model(input_ids=ids, attention_mask=mask, labels=label_t)
+        n_forward += 1
+
         orig_logits = outputs.logits
         orig_pred = int(orig_logits.argmax(-1).item())
         orig_loss = float(F.cross_entropy(orig_logits, label_t).item())
@@ -140,9 +145,11 @@ def token_level_gcg_single_baseline(
         embeds = embeds.clone().detach().requires_grad_(True)
 
         outputs = model(inputs_embeds=embeds, attention_mask=cur_mask, labels=label_t)
+        n_forward += 1
         loss = F.cross_entropy(outputs.logits, label_t)
         grad = torch.autograd.grad(loss, embeds)[0].squeeze(0)  # [T,H]
-
+        n_backward += 1
+        
         cur_loss_val = float(loss.item())
         
         # generate candidate pool
@@ -182,6 +189,7 @@ def token_level_gcg_single_baseline(
                     attention_mask=cur_mask,
                     labels=label_t,
                 )
+                n_forward += 1
                 loss_c = float(F.cross_entropy(outputs_c.logits, label_t).item())
             # 无目标攻击：选择让 loss 最大的那个候选
             if (best_loss is None) or (loss_c > best_loss):
@@ -194,9 +202,18 @@ def token_level_gcg_single_baseline(
         if best_loss is not None and best_loss > cur_loss_val + 1e-9:
             cur_ids[0, best_pos] = best_tok
             changed_any = True
-
+            with torch.no_grad():
+                check_out = model(input_ids=cur_ids, attention_mask=cur_mask)
+                n_forward += 1
+                current_pred = int(check_out.logits.argmax(-1).item())
+                if current_pred != true_label:
+                    # 只要成功翻了标签，就可以提前停止了
+                    break   
+        else:
+            break
         if not changed_any:
             break
+        
 
     # ===== 5) 最终对抗预测 =====
     with torch.no_grad():
@@ -205,12 +222,16 @@ def token_level_gcg_single_baseline(
             attention_mask=cur_mask,
             labels=label_t,
         )
+        n_forward += 1
         adv_logits = outputs_fin.logits
         adv_pred = int(adv_logits.argmax(-1).item())
         adv_loss = float(F.cross_entropy(adv_logits, label_t).item())
 
     success = (adv_pred != orig_pred)
-    return orig_pred, orig_loss, adv_pred, adv_loss, success, cur_ids.squeeze(0)
+    D_tokens = int(cur_mask.sum().item())
+
+    return orig_pred, orig_loss, adv_pred, adv_loss, success, cur_ids.squeeze(0), n_forward, n_backward, D_tokens
+
 
 # token-level GCG attack for reft model
 def token_level_gcg_single_reft(
@@ -228,7 +249,8 @@ def token_level_gcg_single_reft(
     forbid_special: bool = True,
     attack_mode: str = "suffix",
     n_candidates_per_it: int = 128,
-    reft_loc_mode: str = "train" # "train": 固定用训练时的位置；"last_token": 总是指向最后一个token
+    reft_loc_mode: str = "last_n", # 修改点：默认改为 last_n 模式, "train": 固定用训练时的位置；"last_token": 总是指向最后一个token
+    n_reft_positions: int = 10
 ):
     """  
     Perform token-level GCG attack for ReFT model.  
@@ -239,8 +261,10 @@ def token_level_gcg_single_reft(
     reft_loc_mode:  
     - "train": 固定使用训练时的 intervention_locations  
     - "last_token": 动态更新 intervention_locations，总是指向当前输入的最后一个 token
+    - "last_n": 动态更新 intervention_locations，总是指向当前输入的最后 N 个 token（N 由 n_reft_positions 控制）
     """  
     reft_model.eval()
+    num_interventions = len(reft_model.config.representations)
     ids = input_ids.unsqueeze(0).to(device)  # (1, L)
     mask = attention_mask.unsqueeze(0).to(device)  # (1, L)
     label_t = torch.tensor([true_label], device=device)  # (1,)
@@ -258,7 +282,19 @@ def token_level_gcg_single_reft(
                 base_intervention.unsqueeze(1).permute(0, 1, 2).tolist(),
             )
         }
-
+    def make_unit_locations_last_n(seq_len: int, n: int, num_interventions: int):
+        start_pos = max(0, seq_len - n)
+        pos_list = list(range(start_pos, seq_len))
+        unit_locations = [[pos_list] for _ in range(num_interventions)]
+        return {"sources->base": (None, unit_locations)}
+    
+    def make_unit_locations_full(seq_len: int, num_interventions: int):
+        # 覆盖所有 token: 0..seq_len-1
+        pos_list = list(range(seq_len))
+        # 结构要和你当前 last_n 一致：[[pos_list]] per intervention
+        unit_locations = [[pos_list] for _ in range(num_interventions)]
+        return {"sources->base": (None, unit_locations)}
+    
     def make_unit_locations_last_token(seq_len: int):
         # 忽略 intervention_locations，永远挂在当前序列最后一个 token 上
         last_pos = seq_len - 1
@@ -276,6 +312,10 @@ def token_level_gcg_single_reft(
             return make_unit_locations_train()
         elif reft_loc_mode == "last_token":
             return make_unit_locations_last_token(seq_len)
+        elif reft_loc_mode == "last_n":
+            return make_unit_locations_last_n(seq_len, n_reft_positions,num_interventions)
+        elif reft_loc_mode == "full":
+            return make_unit_locations_full(seq_len, num_interventions)
         else:
             raise ValueError(f"Unknown reft_loc_mode: {reft_loc_mode}")
 
@@ -298,12 +338,7 @@ def token_level_gcg_single_reft(
             return orig_pred, orig_loss, orig_pred, orig_loss, False, ids.squeeze(0)
 
         # 初始化 suffix，用一个正常 token 即可
-        if tokenizer.eos_token_id is not None:
-            init_tok = tokenizer.eos_token_id
-        elif tokenizer.pad_token_id is not None:
-            init_tok = tokenizer.pad_token_id
-        else:
-            init_tok = tokenizer.encode("!")[0]
+        init_tok = tokenizer.encode("!")[0]
 
         suffix_ids = torch.full(
             (1, suffix_len),
@@ -416,10 +451,24 @@ def token_level_gcg_single_reft(
 
         # 5.4 接受最优候选（如果能增大 loss）
         changed_any = False
+        # 只要找到了比当前更好的候选（loss更大），就接受它
         if best_loss is not None and best_loss > cur_loss_val + 1e-9:
             cur_ids[0, best_pos] = best_tok
             changed_any = True
-
+            
+            # --- 关键：加入早停逻辑，实现公平对比 ---
+            with torch.no_grad():
+                T_check = cur_ids.size(1)
+                _, check_out = reft_model(
+                    {"input_ids": cur_ids, "attention_mask": cur_mask},
+                    unit_locations=get_unit_locations(T_check)
+                )
+                current_pred = int(check_out.logits.argmax(-1).item())
+                if current_pred != true_label:
+                    # 只要标签翻转了，立刻停止攻击，保留当前的后缀
+                    break 
+        
+        # 如果一整轮候选搜索下来，Loss都没有任何提升，说明攻击遇到瓶颈，停止
         if not changed_any:
             break
 

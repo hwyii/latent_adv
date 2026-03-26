@@ -95,7 +95,9 @@ def main():
     parser.add_argument("--attack_mode", type=str, default="suffix")
     parser.add_argument("--n_candidates_per_it", type=int, default=128)
     parser.add_argument("--reft_loc_mode", type=str, default="train",
-                        help="ReFT 干预位置的选择方式，train / last_token")
+                        help="ReFT 干预位置的选择方式，train / last_n")
+    parser.add_argument("--n_reft_positions", type=int, default=10,
+                        help="如果 reft_loc_mode 是 last_n，则指定最后 n 个位置")
 
     args = parser.parse_args()
     set_seed(args.seed)
@@ -116,7 +118,7 @@ def main():
     #with open("src/data/helpful_splits.json", "r") as f:
         #splits = json.load(f)
 
-    attack_indices = splits["attack"] 
+    attack_indices = splits["attack"] # 所有用于攻击评估的样本索引
     
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
@@ -171,7 +173,7 @@ def main():
         attention_mask = sample["attention_mask"]
         label = int(sample["labels"].item())
         inter_locs = sample["intervention_locations"]
-
+        
         orig_pred, orig_loss, adv_pred, adv_loss, success, adv_ids = token_level_gcg_single_reft(
             reft_model=reft_model,
             tokenizer=tokenizer,
@@ -187,6 +189,7 @@ def main():
             attack_mode=args.attack_mode,
             n_candidates_per_it=args.n_candidates_per_it,
             reft_loc_mode=args.reft_loc_mode,
+            n_reft_positions=args.n_reft_positions,
         )
 
         # 更新统计

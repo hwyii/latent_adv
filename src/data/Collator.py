@@ -6,6 +6,7 @@ class Collator:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "left"  # decoder-only: pad left so last token is real
         self.max_length = max_length
 
     def __call__(self, batch):

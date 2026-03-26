@@ -1,4 +1,4 @@
-import os, argparse, yaml, torch, json, csv, sys, logging
+import os, argparse, yaml, torch, json, csv, sys, logging, random, numpy as np
 from transformers import TrainingArguments
 from transformers.utils import logging as hf_logging
 from transformers import EarlyStoppingCallback
@@ -10,13 +10,23 @@ from src.data.datasets_reft import (
 from src.training.reft_adv_trainer import (
     ReftAdversarialTrainerForSequenceClassification,
 )
-from src.training.reft_adv_trainer_new import (
-    ReftAdversarialTrainerForSequenceClassificationNew,
-)
 from src.attack.inner_attack import AttackConfig
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support  
 from src.utils.tools import set_seed
 from omegaconf import OmegaConf
+
+def set_deterministic_seed(seed=42):
+    """强制锁死所有随机性，保证 100% 可复现"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # 如果有多个 GPU
+    
+    # 强制 cuDNN 使用确定性算法
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -49,6 +59,7 @@ def compute_metrics(eval_pred):
     }
 
 def main():
+    set_deterministic_seed(seed=42)
     # 允许命令行传入 key=value 来覆盖 yaml 配置，例如: python train.py config=base.yaml train.lr=0.01
     cli_conf = OmegaConf.from_cli()
     
@@ -95,7 +106,6 @@ def main():
         splits = json.load(f)
     train_indices = splits.get(cfg.data.train_split)
     # 减少训练样本
-    import random
     if len(train_indices) > 5000:
         random.seed(cfg.train.seed) # 保证实验可复现
         train_indices = random.sample(train_indices, 5000)
@@ -149,6 +159,9 @@ def main():
         circuit_path=cfg.train.get("circuit_path", None),
         gate_mode=cfg.train.get("gate_mode", "inner_only"),
         circuit_top_k=cfg.train.get("circuit_top_k", None),
+        circuit_type=cfg.train.get("circuit_type", "surrogate"),   
+        mlp_keep_ratio=cfg.train.get("mlp_keep_ratio", 1.0),       
+        mlp_mask_path=cfg.train.get("mlp_mask_path", None), 
     )
 
     # --- 7. Trainer & Run ---
