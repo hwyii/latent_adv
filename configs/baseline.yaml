@@ -26,3 +26,9 @@ train:
 
 out:
   dir: "outputs/default_run"
+
+hf:
+  enable: true
+  repo_id: "Hawaii0126/latent_adv"
+  upload_epochs: true    # upload epoch{n}_{data}.pt after each epoch
+  delete_local: true     # delete local .pt after successful upload to save disk

@@ -5,6 +5,11 @@ from torch.utils.data import DataLoader
 import os, time, math, torch, numpy as np, random, json, time
 from src.utils.tools import set_seed
 import wandb
+try:
+    from huggingface_hub import HfApi
+    _hf_api = HfApi()
+except ImportError:
+    _hf_api = None
 # ------------------ 全局计数器 ------------------
 GLOBAL_COUNTS = {
     "n_train_full_fwd_samples": 0,
@@ -174,9 +179,37 @@ def compute_flops_baseline(global_counts, model_num_params, pretrain_total_token
 
     return stats
 
-def save_checkpoint(model, out_dir, name="best.pt"):
+def _hf_upload(local_path: str, repo_id: str, path_in_repo: str, delete_local: bool = False):
+    """Upload a single file to HuggingFace Hub. Logs errors without raising."""
+    if _hf_api is None:
+        print("[HF] huggingface_hub not installed, skipping upload.")
+        return
+    try:
+        print(f"[HF] Uploading {local_path} → {repo_id}/{path_in_repo} ...", flush=True)
+        _hf_api.upload_file(
+            path_or_fileobj=local_path,
+            path_in_repo=path_in_repo,
+            repo_id=repo_id,
+            repo_type="model",
+        )
+        print(f"[HF] Upload done: {path_in_repo}", flush=True)
+        if delete_local:
+            os.remove(local_path)
+            print(f"[HF] Deleted local file: {local_path}", flush=True)
+    except Exception as e:
+        print(f"[HF] Upload failed for {local_path}: {e}", flush=True)
+
+
+def save_checkpoint(model, out_dir, name="best.pt", hf_cfg=None, hf_prefix=""):
+    """Save state-dict locally; optionally upload to HF Hub."""
     ensure_outdir(out_dir)
-    torch.save(model.state_dict(), os.path.join(out_dir, name))
+    local_path = os.path.join(out_dir, name)
+    torch.save(model.state_dict(), local_path)
+    if hf_cfg and hf_cfg.get("enable", False):
+        repo_id = hf_cfg["repo_id"]
+        path_in_repo = f"{hf_prefix}/{name}".lstrip("/")
+        _hf_upload(local_path, repo_id, path_in_repo,
+                   delete_local=hf_cfg.get("delete_local", False))
     
 def train_baseline(cfg: dict):
     t0_wall = time.time()
@@ -201,15 +234,20 @@ def train_baseline(cfg: dict):
     
     set_seed(cfg["seed"])
     ensure_outdir(cfg["out"]["dir"])
-    
+
+    # HF Hub config
+    hf_cfg = cfg.get("hf", {})
+    model_short = cfg["model"]["name"].split("/")[-1]
+    hf_prefix = f"stage0/{model_short}/{data}"
+
     tok = AutoTokenizer.from_pretrained(cfg["model"]["name"], use_fast=True)
     if tok.pad_token is None:
-        tok.pad_token = tok.eos_token   
-    
+        tok.pad_token = tok.eos_token
+
     train_loader, val_loader = build_dataloaders(cfg)
     model, device = build_model(cfg)
     optim, sched = build_opt_sched(model, cfg, train_loader)
-    
+
     use_fp16 = bool(cfg["train"]["fp16"]) and (device.type == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
     accum_steps = int(cfg["train"].get("grad_accum_steps", 1))
@@ -229,13 +267,22 @@ def train_baseline(cfg: dict):
         # wandb: eval
         if wandb is not None and wandb.run is not None:
             wandb.log({"eval/acc": acc, "eval/loss": eval_loss, "epoch": epoch})
-        if acc > best_acc:               
+
+        # per-epoch checkpoint (always upload; delete_local applies)
+        if hf_cfg.get("upload_epochs", False):
+            save_checkpoint(model, cfg["out"]["dir"],
+                            name=f"epoch{epoch}_{data}.pt",
+                            hf_cfg=hf_cfg, hf_prefix=hf_prefix)
+
+        if acc > best_acc:
             best_acc = acc
-            save_checkpoint(model, cfg["out"]["dir"], name=f"best_{data}.pt")
+            save_checkpoint(model, cfg["out"]["dir"], name=f"best_{data}.pt",
+                            hf_cfg=hf_cfg, hf_prefix=hf_prefix)
             print(f"New best accuracy: {best_acc:.4f}. Model checkpoint saved.")
         if eval_loss < best_eval_loss:
             best_eval_loss = eval_loss
-            save_checkpoint(model, cfg["out"]["dir"], name=f"best_loss_{data}.pt")
+            save_checkpoint(model, cfg["out"]["dir"], name=f"best_loss_{data}.pt",
+                            hf_cfg=hf_cfg, hf_prefix=hf_prefix)
     # 在 train_baseline 最后，打印 / 保存 stats
     N = sum(p.numel() for p in model.parameters())
     stats = compute_flops_baseline(GLOBAL_COUNTS, model_num_params=N, pretrain_total_tokens=3e11)
@@ -260,6 +307,13 @@ def train_baseline(cfg: dict):
         wandb.summary["model_n_params"] = int(N)
         wandb.finish()
 
-    with open(os.path.join(cfg["out"]["dir"], f"flop_stats_{data}.json"), "w") as f:
+    stats_path = os.path.join(cfg["out"]["dir"], f"flop_stats_{data}.json")
+    with open(stats_path, "w") as f:
         json.dump(stats, f, indent=2)
+
+    # Upload flop_stats JSON to HF Hub (small file, always keep local)
+    if hf_cfg.get("enable", False):
+        _hf_upload(stats_path, hf_cfg["repo_id"], f"{hf_prefix}/flop_stats_{data}.json",
+                   delete_local=False)
+
     return stats
