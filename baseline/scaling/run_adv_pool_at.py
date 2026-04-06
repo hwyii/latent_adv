@@ -134,7 +134,10 @@ def main():
 
     # misc
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--use_fp16", action="store_true")
+    ap.add_argument("--torch_dtype", type=str, default="bfloat16",
+                    choices=["float32", "float16", "bfloat16"])
+    ap.add_argument("--device_map", type=str, default=None,
+                    help="多卡时传 'auto'，单卡留空")
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -143,11 +146,18 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
+
     # 1) load base tokenizer + config + model skeleton
     tokenizer = AutoTokenizer.from_pretrained(args.base_model_path, use_fast=True)
 
     config = AutoConfig.from_pretrained(args.base_model_path)
-    model = AutoModelForSequenceClassification.from_pretrained(args.base_model_path, config=config)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        args.base_model_path, config=config,
+        attn_implementation="eager",
+        torch_dtype=dtype_map[args.torch_dtype],
+        device_map=args.device_map,
+    )
 
     # pad token fix
     if tokenizer.pad_token is None:
@@ -159,9 +169,8 @@ def main():
     print(f"[load] loaded {args.model_pt} into base model {args.base_model_path}")
     print(f"[load_state_dict] missing={n_missing}, unexpected={n_unexpected}")
 
-    model.to(device)
-    if args.use_fp16 and device.type == "cuda":
-        model = model.half()
+    if args.device_map is None:
+        model.to(device)
     model.eval()
 
     # Kaplan: param count (N)
